@@ -1,6 +1,6 @@
 """Tests for edge cases and branch coverage across pool, store, and strategies."""
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -9,10 +9,12 @@ from credweave.application.ports.strategy import CredentialCandidate, SelectionC
 from credweave.application.services.pool import CredentialPool
 from credweave.domain.enums import CredentialState, OutcomeType
 from credweave.domain.errors import (
+    ConfigurationError,
     InvalidLeaseError,
     InvalidOutcomeError,
     LeaseExpiredError,
     NoCredentialsAvailableError,
+    StateStoreError,
 )
 from credweave.domain.models import Credential, Lease
 from credweave.domain.outcomes import Outcome
@@ -89,6 +91,18 @@ class DummyStore(StateStore):
         timestamp: datetime,
     ) -> None:
         pass
+
+    def release_lease(self, credential_id: str) -> None:
+        rec = self._records.get(credential_id)
+        if rec:
+            self._records[credential_id] = CredentialRecord(
+                credential_id=credential_id,
+                state=rec.state,
+                in_flight_leases=max(0, rec.in_flight_leases - 1),
+            )
+
+    async def release_lease_async(self, credential_id: str) -> None:
+        self.release_lease(credential_id)
 
 
 def test_pool_with_dummy_store_branches(sample_credential: Credential) -> None:
@@ -232,3 +246,139 @@ def test_round_robin_tag_types_and_fallback(sample_credentials: list[Credential]
     fallback_sel = strat.select(all_cands)
     assert fallback_sel is not None
     assert fallback_sel.credential_id == "cred-alpha"
+
+
+def test_missing_default_adapters_raise_configuration_error(
+    sample_credential: Credential,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify ConfigurationError is raised when an adapter is missing and has no default."""
+    import credweave.application.services.pool as pool_module
+
+    # Missing clock
+    monkeypatch.setattr(pool_module, "_default_clock_factory", None)
+    with pytest.raises(ConfigurationError, match="No clock provided"):
+        CredentialPool(credentials=[sample_credential])
+
+    # Missing strategy
+    monkeypatch.undo()
+    monkeypatch.setattr(pool_module, "_default_strategy_factory", None)
+    with pytest.raises(ConfigurationError, match="No strategy provided"):
+        CredentialPool(credentials=[sample_credential])
+
+    # Missing source
+    monkeypatch.undo()
+    monkeypatch.setattr(pool_module, "_default_source_factory", None)
+    with pytest.raises(ConfigurationError, match="No source provided"):
+        CredentialPool(credentials=[sample_credential])
+
+    # Missing store
+    monkeypatch.undo()
+    monkeypatch.setattr(pool_module, "_default_store_factory", None)
+    with pytest.raises(ConfigurationError, match="No store provided"):
+        CredentialPool(credentials=[sample_credential])
+
+
+def test_expired_lease_release_failure_restores_active_lease(
+    sample_credential: Credential,
+    test_clock: TestClock,
+) -> None:
+    """Verify failed store.release_lease on expired lease restores lease in pool tracking."""
+    store = MemoryStateStore(clock=test_clock)
+    pool = CredentialPool(
+        credentials=[sample_credential],
+        store=store,
+        clock=test_clock,
+        lease_timeout=5.0,
+    )
+    lease = pool.acquire_sync()
+    test_clock.advance(10.0)
+
+    def failing_release_lease(credential_id: str) -> None:
+        raise StateStoreError("Release failed in storage backend")
+
+    store.release_lease = failing_release_lease  # type: ignore[method-assign]
+
+    with pytest.raises(StateStoreError):
+        pool.report_sync(lease, Outcome.success())
+
+    # Lease must still be present in pool active leases
+    assert pool.in_flight_leases == 1
+    assert lease.lease_id in [active_l.lease_id for active_l in pool.active_leases]
+
+
+@pytest.mark.asyncio
+async def test_expired_lease_async_release_failure_restores_active_lease(
+    sample_credential: Credential,
+    test_clock: TestClock,
+) -> None:
+    """Verify failed async release_lease on expired lease restores lease in pool tracking."""
+    store = MemoryStateStore(clock=test_clock)
+    pool = CredentialPool(
+        credentials=[sample_credential],
+        store=store,
+        clock=test_clock,
+        lease_timeout=5.0,
+    )
+    lease = await pool.acquire()
+    test_clock.advance(10.0)
+
+    async def failing_release_lease_async(credential_id: str) -> None:
+        raise StateStoreError("Async release failed in storage backend")
+
+    store.release_lease_async = failing_release_lease_async  # type: ignore[method-assign]
+
+    with pytest.raises(StateStoreError):
+        await pool.report(lease, Outcome.success())
+
+    assert pool.in_flight_leases == 1
+
+
+def test_memory_state_store_precedence_branches(test_clock: TestClock) -> None:
+    """Verify precedence rules: DISABLED state, UNHEALTHY escalating to REVOKED, etc."""
+    store = MemoryStateStore(clock=test_clock, max_consecutive_failures=2)
+    now = test_clock.now()
+
+    # 1. DISABLED state ignores outcomes
+    store.update_state("c1", CredentialState.DISABLED)
+    store.record_acquire("c1", now)
+    store.record_outcome("c1", Outcome.success(), now)
+    assert store.get_record("c1").state == CredentialState.DISABLED  # type: ignore[union-attr]
+
+    # 2. UNHEALTHY escalates to REVOKED on AUTH_FAILED
+    store.update_state("c2", CredentialState.UNHEALTHY)
+    store.record_outcome("c2", Outcome.auth_failed(), now)
+    assert store.get_record("c2").state == CredentialState.REVOKED  # type: ignore[union-attr]
+
+    # 3. Active cooldown escalates to UNHEALTHY on PERMANENT_FAILURE
+    store.update_state(
+        "c3",
+        CredentialState.COOLDOWN,
+        cooldown_until=now + timedelta(seconds=60),
+    )
+    store.record_outcome("c3", Outcome.permanent_failure(), now)
+    assert store.get_record("c3").state == CredentialState.UNHEALTHY  # type: ignore[union-attr]
+
+    # 4. Active cooldown escalates to REVOKED on AUTH_FAILED
+    store.update_state(
+        "c4",
+        CredentialState.RATE_LIMITED,
+        cooldown_until=now + timedelta(seconds=60),
+    )
+    store.record_outcome("c4", Outcome.auth_failed(), now)
+    assert store.get_record("c4").state == CredentialState.REVOKED  # type: ignore[union-attr]
+
+    # 5. Active cooldown transient failure exceeding max_consecutive_failures -> UNHEALTHY
+    store.update_state(
+        "c5",
+        CredentialState.COOLDOWN,
+        cooldown_until=now + timedelta(seconds=60),
+    )
+    # Give it 1 failure already
+    rec = store.get_record("c5")
+    assert rec is not None
+    object.__setattr__(rec, "consecutive_failures", 1)
+    store._records["c5"] = rec
+    # Second failure reaches max=2
+    store.record_outcome("c5", Outcome.transient_error(retry_after=10.0), now)
+    assert store.get_record("c5").state == CredentialState.UNHEALTHY  # type: ignore[union-attr]

@@ -6,6 +6,7 @@ external services through a unified, provider-agnostic abstraction.
 
 from importlib.metadata import PackageNotFoundError, version
 
+from credweave._internal.composition import configure_default_adapters
 from credweave.application.ports.clock import Clock
 from credweave.application.ports.credential_source import CredentialSource
 from credweave.application.ports.state_store import CredentialRecord, StateStore
@@ -38,6 +39,10 @@ from credweave.infrastructure.clocks.system import SystemClock
 from credweave.infrastructure.sources.static import StaticSource
 from credweave.infrastructure.stores.memory import MemoryStateStore
 from credweave.strategies.round_robin import RoundRobinStrategy
+
+# Wire default adapters into application services at composition root
+configure_default_adapters()
+
 
 try:
     __version__ = version("credweave")

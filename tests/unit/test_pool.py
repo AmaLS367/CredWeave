@@ -12,6 +12,7 @@ from credweave.domain.errors import (
     InvalidOutcomeError,
     LeaseExpiredError,
     NoCredentialsAvailableError,
+    StateStoreError,
 )
 from credweave.domain.models import Credential, Lease
 from credweave.domain.outcomes import Outcome
@@ -384,3 +385,166 @@ def test_list_records_sync_and_async(sample_credentials: list[Credential]) -> No
     assert len(records) == 3
     ids = {r.credential_id for r in records}
     assert ids == {"cred-alpha", "cred-beta", "cred-gamma"}
+
+
+def test_expired_lease_does_not_apply_caller_outcome_sync(
+    sample_credential: Credential, test_clock: TestClock
+) -> None:
+    """Verify expired lease raises LeaseExpiredError without altering credential state."""
+    pool = CredentialPool(
+        credentials=[sample_credential],
+        clock=test_clock,
+        lease_timeout=10.0,
+    )
+    lease = pool.acquire_sync()
+    assert pool.in_flight_leases == 1
+
+    test_clock.advance(15.0)
+
+    # Caller reports AUTH_FAILED on expired lease
+    with pytest.raises(LeaseExpiredError):
+        pool.report_sync(lease, Outcome.auth_failed(reason="Should not be applied"))
+
+    # Active lease tracking is released
+    assert pool.in_flight_leases == 0
+
+    # Store record must NOT be REVOKED or modified by the rejected outcome
+    rec = pool.get_record(sample_credential.id)
+    assert rec is not None
+    assert rec.state == CredentialState.AVAILABLE
+    assert rec.in_flight_leases == 0
+    assert rec.consecutive_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_expired_lease_does_not_apply_caller_outcome_async(
+    sample_credential: Credential, test_clock: TestClock
+) -> None:
+    """Verify expired lease in async report releases lease without altering health state."""
+    pool = CredentialPool(
+        credentials=[sample_credential],
+        clock=test_clock,
+        lease_timeout=10.0,
+    )
+    lease = await pool.acquire()
+    assert pool.in_flight_leases == 1
+
+    test_clock.advance(15.0)
+
+    # Caller reports PERMANENT_FAILURE on expired lease
+    with pytest.raises(LeaseExpiredError):
+        await pool.report(lease, Outcome.permanent_failure(reason="Late failure"))
+
+    assert pool.in_flight_leases == 0
+    rec = await pool.get_record_async(sample_credential.id)
+    assert rec is not None
+    assert rec.state == CredentialState.AVAILABLE
+    assert rec.in_flight_leases == 0
+
+
+def test_report_sync_failure_safe_allows_retry(
+    sample_credential: Credential, test_clock: TestClock
+) -> None:
+    """Verify failed store.record_outcome retains lease so caller can retry safely."""
+    store = MemoryStateStore(clock=test_clock)
+    pool = CredentialPool(
+        credentials=[sample_credential],
+        store=store,
+        clock=test_clock,
+    )
+
+    lease = pool.acquire_sync()
+    assert pool.in_flight_leases == 1
+
+    # Temporarily monkeypatch store.record_outcome to simulate transient failure
+    original_record_outcome = store.record_outcome
+    attempts = 0
+
+    def flaky_record_outcome(credential_id: str, outcome: Outcome, timestamp: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise StateStoreError("Transient storage connection failure")
+        original_record_outcome(credential_id, outcome, timestamp)  # type: ignore[arg-type]
+
+    store.record_outcome = flaky_record_outcome  # type: ignore[method-assign]
+
+    # First attempt: store fails
+    with pytest.raises(StateStoreError):
+        pool.report_sync(lease, Outcome.success())
+
+    # Lease must still be active and preserved in tracking
+    assert pool.in_flight_leases == 1
+    assert lease.lease_id in [active_l.lease_id for active_l in pool.active_leases]
+
+    # Second attempt (retry): succeeds
+    pool.report_sync(lease, Outcome.success())
+
+    # Now the lease is released and outcome recorded
+    assert pool.in_flight_leases == 0
+    rec = pool.get_record(sample_credential.id)
+    assert rec is not None
+    assert rec.in_flight_leases == 0
+    assert rec.state == CredentialState.AVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_report_async_failure_safe_allows_retry(
+    sample_credential: Credential, test_clock: TestClock
+) -> None:
+    """Verify failed store.record_outcome_async retains lease in async report for safe retry."""
+    store = MemoryStateStore(clock=test_clock)
+    pool = CredentialPool(
+        credentials=[sample_credential],
+        store=store,
+        clock=test_clock,
+    )
+
+    lease = await pool.acquire()
+    assert pool.in_flight_leases == 1
+
+    original_record_outcome_async = store.record_outcome_async
+    attempts = 0
+
+    async def flaky_record_outcome_async(
+        credential_id: str, outcome: Outcome, timestamp: object
+    ) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise StateStoreError("Transient storage connection failure")
+        await original_record_outcome_async(credential_id, outcome, timestamp)  # type: ignore[arg-type]
+
+    store.record_outcome_async = flaky_record_outcome_async  # type: ignore[method-assign]
+
+    # First attempt fails
+    with pytest.raises(StateStoreError):
+        await pool.report(lease, Outcome.success())
+
+    # Lease preserved
+    assert pool.in_flight_leases == 1
+
+    # Retry succeeds
+    await pool.report(lease, Outcome.success())
+    assert pool.in_flight_leases == 0
+
+
+def test_pool_transient_error_uses_configured_default_cooldown(
+    sample_credential: Credential, test_clock: TestClock
+) -> None:
+    """Verify pool passes default_cooldown to transient errors when outcome has no retry_after."""
+    pool = CredentialPool(
+        credentials=[sample_credential],
+        clock=test_clock,
+        default_cooldown=120.0,
+    )
+    now = test_clock.now()
+    lease = pool.acquire_sync()
+    pool.report_sync(lease, Outcome.transient_error())
+
+    rec = pool.get_record(sample_credential.id)
+    assert rec is not None
+    assert rec.state == CredentialState.COOLDOWN
+    assert rec.cooldown_until is not None
+    elapsed = (rec.cooldown_until - now).total_seconds()
+    assert elapsed == 120.0

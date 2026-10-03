@@ -3,7 +3,7 @@
 import asyncio
 import threading
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from credweave.application.ports.clock import Clock
 from credweave.application.ports.credential_source import CredentialSource
@@ -24,10 +24,40 @@ from credweave.domain.errors import (
 )
 from credweave.domain.models import Credential, Lease
 from credweave.domain.outcomes import Outcome
-from credweave.infrastructure.clocks.system import SystemClock
-from credweave.infrastructure.sources.static import StaticSource
-from credweave.infrastructure.stores.memory import MemoryStateStore
-from credweave.strategies.round_robin import RoundRobinStrategy
+
+ClockFactory = Callable[[], Clock]
+StrategyFactory = Callable[[], SelectionStrategy]
+SourceFactory = Callable[[Sequence[Credential]], CredentialSource]
+StoreFactory = Callable[[Clock, float, int], StateStore]
+
+_default_clock_factory: ClockFactory | None = None
+_default_strategy_factory: StrategyFactory | None = None
+_default_source_factory: SourceFactory | None = None
+_default_store_factory: StoreFactory | None = None
+
+
+def register_default_adapters(
+    *,
+    clock_factory: ClockFactory | None = None,
+    strategy_factory: StrategyFactory | None = None,
+    source_factory: SourceFactory | None = None,
+    store_factory: StoreFactory | None = None,
+) -> None:
+    """Register default adapter factories for pool initialization.
+
+    Invoked by the composition/public layer to decouple application services
+    from concrete infrastructure adapters.
+    """
+    global _default_clock_factory, _default_strategy_factory
+    global _default_source_factory, _default_store_factory
+    if clock_factory is not None:
+        _default_clock_factory = clock_factory
+    if strategy_factory is not None:
+        _default_strategy_factory = strategy_factory
+    if source_factory is not None:
+        _default_source_factory = source_factory
+    if store_factory is not None:
+        _default_store_factory = store_factory
 
 
 class CredentialPool:
@@ -73,22 +103,47 @@ class CredentialPool:
             seen_ids.add(cred.id)
 
         self._initial_credentials: tuple[Credential, ...] = tuple(initial_creds)
-        self._clock: Clock = clock if clock is not None else SystemClock()
-        self._strategy: SelectionStrategy = (
-            strategy if strategy is not None else RoundRobinStrategy()
-        )
-        self._source: CredentialSource = (
-            source if source is not None else StaticSource(self._initial_credentials)
-        )
-        self._store: StateStore = (
-            store
-            if store is not None
-            else MemoryStateStore(
-                clock=self._clock,
-                default_cooldown=default_cooldown,
-                max_consecutive_failures=max_consecutive_failures,
+
+        if clock is not None:
+            self._clock: Clock = clock
+        elif _default_clock_factory is not None:
+            self._clock = _default_clock_factory()
+        else:
+            raise ConfigurationError(
+                "No clock provided and no default clock adapter is registered."
             )
-        )
+
+        if strategy is not None:
+            self._strategy: SelectionStrategy = strategy
+        elif _default_strategy_factory is not None:
+            self._strategy = _default_strategy_factory()
+        else:
+            raise ConfigurationError(
+                "No strategy provided and no default strategy adapter is registered."
+            )
+
+        if source is not None:
+            self._source: CredentialSource = source
+        elif _default_source_factory is not None:
+            self._source = _default_source_factory(self._initial_credentials)
+        else:
+            raise ConfigurationError(
+                "No source provided and no default source adapter is registered."
+            )
+
+        if store is not None:
+            self._store: StateStore = store
+        elif _default_store_factory is not None:
+            self._store = _default_store_factory(
+                self._clock,
+                default_cooldown,
+                max_consecutive_failures,
+            )
+        else:
+            raise ConfigurationError(
+                "No store provided and no default store adapter is registered."
+            )
+
         self._lease_timeout = lease_timeout
 
         self._active_leases: dict[str, Lease] = {}
@@ -288,16 +343,30 @@ class CredentialPool:
                     f"got {lease.credential_id!r}).",
                 )
 
+            is_expired = False
             if self._lease_timeout is not None:
                 elapsed = (now - tracked_lease.acquired_at).total_seconds()
                 if elapsed > self._lease_timeout:
-                    self._active_leases.pop(lease.lease_id)
-                    self._store.record_outcome(lease.credential_id, outcome, now)
-                    raise LeaseExpiredError(lease.lease_id)
+                    is_expired = True
 
             self._active_leases.pop(lease.lease_id)
 
-        self._store.record_outcome(lease.credential_id, outcome, now)
+        if is_expired:
+            try:
+                if hasattr(self._store, "release_lease"):
+                    self._store.release_lease(lease.credential_id)
+            except Exception:
+                with self._pool_lock:
+                    self._active_leases[lease.lease_id] = tracked_lease
+                raise
+            raise LeaseExpiredError(lease.lease_id)
+
+        try:
+            self._store.record_outcome(lease.credential_id, outcome, now)
+        except Exception:
+            with self._pool_lock:
+                self._active_leases[lease.lease_id] = tracked_lease
+            raise
 
     async def report(self, lease: Lease, outcome: Outcome) -> None:
         """Report execution outcome for an active lease asynchronously."""
@@ -325,16 +394,35 @@ class CredentialPool:
                     f"got {lease.credential_id!r}).",
                 )
 
+            is_expired = False
             if self._lease_timeout is not None:
                 elapsed = (now - tracked_lease.acquired_at).total_seconds()
                 if elapsed > self._lease_timeout:
-                    self._active_leases.pop(lease.lease_id)
-                    await self._store.record_outcome_async(lease.credential_id, outcome, now)
-                    raise LeaseExpiredError(lease.lease_id)
+                    is_expired = True
 
             self._active_leases.pop(lease.lease_id)
 
-        await self._store.record_outcome_async(lease.credential_id, outcome, now)
+        if is_expired:
+            try:
+                if hasattr(self._store, "release_lease_async"):
+                    await self._store.release_lease_async(lease.credential_id)
+                elif hasattr(self._store, "release_lease"):
+                    self._store.release_lease(lease.credential_id)
+            except Exception:
+                with self._pool_lock:
+                    self._active_leases[lease.lease_id] = tracked_lease
+                raise
+            raise LeaseExpiredError(lease.lease_id)
+
+        try:
+            if hasattr(self._store, "record_outcome_async"):
+                await self._store.record_outcome_async(lease.credential_id, outcome, now)
+            else:
+                self._store.record_outcome(lease.credential_id, outcome, now)
+        except Exception:
+            with self._pool_lock:
+                self._active_leases[lease.lease_id] = tracked_lease
+            raise
 
     def reset_credential(self, credential_id: str) -> None:
         """Reset credential state to AVAILABLE and clear failures and cooldowns synchronously."""

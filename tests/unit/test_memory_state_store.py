@@ -108,7 +108,7 @@ def test_record_outcome_rate_limited_and_recovery(test_clock: TestClock) -> None
     assert rec is not None
     assert rec.state == CredentialState.RATE_LIMITED
     assert rec.in_flight_leases == 0
-    assert rec.consecutive_failures == 1
+    assert rec.consecutive_failures == 0
     assert rec.cooldown_until is not None
 
     # Before cooldown
@@ -220,3 +220,183 @@ def test_concurrent_acquire_and_report(test_clock: TestClock) -> None:
     assert rec is not None
     assert rec.in_flight_leases == 0
     assert rec.total_leases == 100
+
+
+def test_release_lease_decrements_in_flight_without_changing_state(test_clock: TestClock) -> None:
+    """Verify release_lease decrements in-flight leases without altering health or failures."""
+    store = MemoryStateStore(clock=test_clock)
+    now = test_clock.now()
+
+    store.record_acquire("c1", now)
+    assert store.get_record("c1").in_flight_leases == 1  # type: ignore[union-attr]
+
+    store.release_lease("c1")
+    rec = store.get_record("c1")
+    assert rec is not None
+    assert rec.in_flight_leases == 0
+    assert rec.state == CredentialState.AVAILABLE
+    assert rec.consecutive_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_release_lease_async(test_clock: TestClock) -> None:
+    """Verify release_lease_async decrements in-flight leases asynchronously."""
+    store = MemoryStateStore(clock=test_clock)
+    now = test_clock.now()
+
+    store.record_acquire("c1", now)
+    await store.release_lease_async("c1")
+    rec = await store.get_record_async("c1")
+    assert rec is not None
+    assert rec.in_flight_leases == 0
+
+
+def test_late_success_never_resurrects_revoked(test_clock: TestClock) -> None:
+    """Verify a late SUCCESS outcome from another lease never resurrects a REVOKED credential."""
+    store = MemoryStateStore(clock=test_clock)
+    now = test_clock.now()
+
+    # Simulate 2 concurrent leases acquired
+    store.record_acquire("c1", now)
+    store.record_acquire("c1", now)
+    assert store.get_record("c1").in_flight_leases == 2  # type: ignore[union-attr]
+
+    # Lease 1 fails with AUTH_FAILED -> REVOKED
+    store.record_outcome("c1", Outcome.auth_failed(reason="Revoked key"), now)
+    rec1 = store.get_record("c1")
+    assert rec1 is not None
+    assert rec1.state == CredentialState.REVOKED
+    assert rec1.in_flight_leases == 1
+
+    # Lease 2 finishes slightly later with SUCCESS -> must NOT resurrect REVOKED
+    test_clock.advance(1.0)
+    later = test_clock.now()
+    store.record_outcome("c1", Outcome.success(), later)
+
+    rec2 = store.get_record("c1")
+    assert rec2 is not None
+    assert rec2.state == CredentialState.REVOKED
+    assert rec2.in_flight_leases == 0
+
+
+def test_late_success_never_resurrects_unhealthy(test_clock: TestClock) -> None:
+    """Verify a late SUCCESS outcome never resurrects an UNHEALTHY credential."""
+    store = MemoryStateStore(clock=test_clock)
+    now = test_clock.now()
+
+    # Acquire 2 leases
+    store.record_acquire("c1", now)
+    store.record_acquire("c1", now)
+
+    # Lease 1 fails permanently -> UNHEALTHY
+    store.record_outcome("c1", Outcome.permanent_failure(reason="Corrupt provider response"), now)
+    assert store.get_record("c1").state == CredentialState.UNHEALTHY  # type: ignore[union-attr]
+
+    # Lease 2 reports late SUCCESS
+    test_clock.advance(1.0)
+    store.record_outcome("c1", Outcome.success(), test_clock.now())
+
+    rec = store.get_record("c1")
+    assert rec is not None
+    assert rec.state == CredentialState.UNHEALTHY
+    assert rec.in_flight_leases == 0
+
+
+def test_late_success_never_clears_active_rate_limit_cooldown(test_clock: TestClock) -> None:
+    """Verify a late SUCCESS outcome never clears active RATE_LIMITED cooldown."""
+    store = MemoryStateStore(clock=test_clock)
+    now = test_clock.now()
+
+    store.record_acquire("c1", now)
+    store.record_acquire("c1", now)
+
+    # Lease 1 hit 429
+    store.record_outcome("c1", Outcome.rate_limited(retry_after=60.0), now)
+    rec1 = store.get_record("c1")
+    assert rec1 is not None
+    assert rec1.state == CredentialState.RATE_LIMITED
+    expected_cooldown = rec1.cooldown_until
+    assert expected_cooldown is not None
+
+    # Lease 2 reports late SUCCESS while cooldown is still active
+    test_clock.advance(10.0)
+    store.record_outcome("c1", Outcome.success(), test_clock.now())
+
+    rec2 = store.get_record("c1")
+    assert rec2 is not None
+    assert rec2.state == CredentialState.RATE_LIMITED
+    assert rec2.cooldown_until == expected_cooldown
+    assert rec2.in_flight_leases == 0
+
+
+def test_late_success_never_clears_active_transient_cooldown(test_clock: TestClock) -> None:
+    """Verify a late SUCCESS outcome never clears active COOLDOWN from transient error."""
+    store = MemoryStateStore(clock=test_clock)
+    now = test_clock.now()
+
+    store.record_acquire("c1", now)
+    store.record_acquire("c1", now)
+
+    # Lease 1 hit transient error
+    store.record_outcome("c1", Outcome.transient_error(retry_after=30.0), now)
+    rec1 = store.get_record("c1")
+    assert rec1 is not None
+    assert rec1.state == CredentialState.COOLDOWN
+    expected_cooldown = rec1.cooldown_until
+
+    # Lease 2 reports late SUCCESS while cooldown is still active
+    test_clock.advance(5.0)
+    store.record_outcome("c1", Outcome.success(), test_clock.now())
+
+    rec2 = store.get_record("c1")
+    assert rec2 is not None
+    assert rec2.state == CredentialState.COOLDOWN
+    assert rec2.cooldown_until == expected_cooldown
+    assert rec2.in_flight_leases == 0
+
+
+def test_rate_limited_does_not_increment_consecutive_failures_or_trigger_unhealthy(
+    test_clock: TestClock,
+) -> None:
+    """Verify repeated RATE_LIMITED outcomes never make a credential UNHEALTHY."""
+    store = MemoryStateStore(clock=test_clock, max_consecutive_failures=2)
+
+    # Repeatedly rate limit 5 times consecutively across cooldown expirations
+    for _ in range(5):
+        now = test_clock.now()
+        store.record_acquire("c1", now)
+        store.record_outcome("c1", Outcome.rate_limited(retry_after=10.0), now)
+
+        rec = store.get_record("c1")
+        assert rec is not None
+        assert rec.state == CredentialState.RATE_LIMITED
+        assert rec.consecutive_failures == 0
+
+        # Advance past cooldown to auto-recover to AVAILABLE
+        test_clock.advance(11.0)
+        recovered = store.get_record("c1")
+        assert recovered is not None
+        assert recovered.state == CredentialState.AVAILABLE
+
+    # The credential is STILL healthy and was NEVER marked UNHEALTHY
+    final_rec = store.get_record("c1")
+    assert final_rec is not None
+    assert final_rec.state == CredentialState.AVAILABLE
+    assert final_rec.consecutive_failures == 0
+
+
+def test_transient_error_uses_configured_default_cooldown(test_clock: TestClock) -> None:
+    """Verify TRANSIENT_ERROR uses configured default_cooldown instead of hardcoded 5.0."""
+    store = MemoryStateStore(clock=test_clock, default_cooldown=75.0)
+    now = test_clock.now()
+
+    store.record_acquire("c1", now)
+    # No retry_after passed
+    store.record_outcome("c1", Outcome.transient_error(), now)
+
+    rec = store.get_record("c1")
+    assert rec is not None
+    assert rec.state == CredentialState.COOLDOWN
+    assert rec.cooldown_until is not None
+    elapsed = (rec.cooldown_until - now).total_seconds()
+    assert elapsed == 75.0

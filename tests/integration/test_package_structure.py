@@ -65,3 +65,31 @@ def test_submodule_exports() -> None:
     assert CredentialCandidate is not None
     assert SelectionContext is not None
     assert SelectionStrategy is not None
+
+
+def test_clean_architecture_application_has_no_infrastructure_imports() -> None:
+    """Verify that credweave.application layer has zero imports of infrastructure or strategies."""
+    import ast
+    from pathlib import Path
+
+    app_dir = Path(credweave.__file__).parent / "application"
+    assert app_dir.is_dir()
+
+    forbidden_prefixes = ("credweave.infrastructure", "credweave.strategies")
+
+    for py_file in app_dir.rglob("*.py"):
+        tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    for forbidden in forbidden_prefixes:
+                        assert not alias.name.startswith(forbidden), (
+                            f"Clean Architecture violation in {py_file.name}: "
+                            f"imports forbidden '{alias.name}'"
+                        )
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                for forbidden in forbidden_prefixes:
+                    assert not node.module.startswith(forbidden), (
+                        f"Clean Architecture violation in {py_file.name}: "
+                        f"imports from forbidden '{node.module}'"
+                    )

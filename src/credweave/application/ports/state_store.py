@@ -109,3 +109,17 @@ class StateStore(Protocol):
     ) -> None:
         """Record an operation outcome for metrics and state transitions asynchronously."""
         ...
+
+    def release_lease(
+        self,
+        credential_id: str,
+    ) -> None:
+        """Release an in-flight lease without recording an outcome synchronously."""
+        ...
+
+    async def release_lease_async(
+        self,
+        credential_id: str,
+    ) -> None:
+        """Release an in-flight lease without recording an outcome asynchronously."""
+        ...

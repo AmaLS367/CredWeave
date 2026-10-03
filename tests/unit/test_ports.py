@@ -128,6 +128,24 @@ class MockStore:
     ) -> None:
         pass
 
+    def release_lease(
+        self,
+        credential_id: str,
+    ) -> None:
+        rec = self._records.get(credential_id)
+        if rec is not None:
+            self._records[credential_id] = CredentialRecord(
+                credential_id=credential_id,
+                state=rec.state,
+                in_flight_leases=max(0, rec.in_flight_leases - 1),
+            )
+
+    async def release_lease_async(
+        self,
+        credential_id: str,
+    ) -> None:
+        self.release_lease(credential_id)
+
 
 def test_credential_source_protocol(sample_credential: Credential) -> None:
     """Verify CredentialSource protocol adherence."""
