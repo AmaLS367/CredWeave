@@ -22,6 +22,18 @@ def test_outcome_direct_instantiation() -> None:
     assert outcome2.is_rate_limited is True
     assert outcome2.is_failure is True
 
+    outcome3 = Outcome(type="transient_error")  # type: ignore[arg-type]
+    assert outcome3.type == OutcomeType.TRANSIENT_ERROR
+    assert outcome3.is_transient_error is True
+
+    outcome4 = Outcome(type="temporary_failure")  # type: ignore[arg-type]
+    assert outcome4.type == OutcomeType.TRANSIENT_ERROR
+    assert outcome4.is_temporary_failure is True
+
+    outcome5 = Outcome(type="consecutive_failures_exceeded")  # type: ignore[arg-type]
+    assert outcome5.type == OutcomeType.CONSECUTIVE_FAILURES_EXCEEDED
+    assert outcome5.is_consecutive_failures_exceeded is True
+
 
 def test_outcome_factories() -> None:
     """Test outcome factory helper methods."""
@@ -48,6 +60,27 @@ def test_outcome_factories() -> None:
     temp_fail = Outcome.temporary_failure(retry_after=5.0, reason="Gateway Timeout")
     assert temp_fail.type == OutcomeType.TEMPORARY_FAILURE
     assert temp_fail.retry_after == 5.0
+    assert temp_fail.reason == "Gateway Timeout"
+    assert temp_fail.is_transient_error is True
+    assert temp_fail.is_temporary_failure is True
+    assert temp_fail.is_failure is True
+
+    trans_err = Outcome.transient_error(retry_after=10.0, reason="Network timeout")
+    assert trans_err.type == OutcomeType.TRANSIENT_ERROR
+    assert trans_err.retry_after == 10.0
+    assert trans_err.reason == "Network timeout"
+    assert trans_err.is_transient_error is True
+    assert trans_err.is_temporary_failure is True
+    assert trans_err.is_failure is True
+
+    consec_fail = Outcome.consecutive_failures_exceeded(
+        retry_after=60.0, reason="Max consecutive failures exceeded"
+    )
+    assert consec_fail.type == OutcomeType.CONSECUTIVE_FAILURES_EXCEEDED
+    assert consec_fail.retry_after == 60.0
+    assert consec_fail.reason == "Max consecutive failures exceeded"
+    assert consec_fail.is_consecutive_failures_exceeded is True
+    assert consec_fail.is_failure is True
 
     perm_fail = Outcome.permanent_failure(reason="Account suspended")
     assert perm_fail.type == OutcomeType.PERMANENT_FAILURE

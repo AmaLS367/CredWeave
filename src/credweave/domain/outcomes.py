@@ -66,6 +66,21 @@ class Outcome:
         """Return True if this outcome was caused by rate limiting."""
         return self.type == OutcomeType.RATE_LIMITED
 
+    @property
+    def is_transient_error(self) -> bool:
+        """Return True if this outcome was caused by a transient failure."""
+        return self.type == OutcomeType.TRANSIENT_ERROR
+
+    @property
+    def is_temporary_failure(self) -> bool:
+        """Return True if this outcome was caused by a transient failure (compatibility alias)."""
+        return self.is_transient_error
+
+    @property
+    def is_consecutive_failures_exceeded(self) -> bool:
+        """Return True if this outcome indicates consecutive failure threshold was exceeded."""
+        return self.type == OutcomeType.CONSECUTIVE_FAILURES_EXCEEDED
+
     @classmethod
     def success(
         cls,
@@ -122,7 +137,7 @@ class Outcome:
         )
 
     @classmethod
-    def temporary_failure(
+    def transient_error(
         cls,
         *,
         retry_after: float | None = None,
@@ -131,7 +146,38 @@ class Outcome:
     ) -> "Outcome":
         """Factory for a transient failure (e.g. network timeout or 503)."""
         return cls(
-            type=OutcomeType.TEMPORARY_FAILURE,
+            type=OutcomeType.TRANSIENT_ERROR,
+            retry_after=retry_after,
+            reason=reason,
+            metadata=metadata or {},
+        )
+
+    @classmethod
+    def temporary_failure(
+        cls,
+        *,
+        retry_after: float | None = None,
+        reason: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> "Outcome":
+        """Factory for a transient failure (compatibility alias for :meth:`transient_error`)."""
+        return cls.transient_error(
+            retry_after=retry_after,
+            reason=reason,
+            metadata=metadata,
+        )
+
+    @classmethod
+    def consecutive_failures_exceeded(
+        cls,
+        *,
+        retry_after: float | None = None,
+        reason: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> "Outcome":
+        """Factory for an outcome indicating repeated consecutive failures have exceeded limits."""
+        return cls(
+            type=OutcomeType.CONSECUTIVE_FAILURES_EXCEEDED,
             retry_after=retry_after,
             reason=reason,
             metadata=metadata or {},

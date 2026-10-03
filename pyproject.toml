@@ -49,10 +49,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/credweave/credweave"
-Documentation = "https://github.com/credweave/credweave#readme"
-Repository = "https://github.com/credweave/credweave"
-Issues = "https://github.com/credweave/credweave/issues"
+Homepage = "https://github.com/AmaLS367/CredWeave"
+Documentation = "https://github.com/AmaLS367/CredWeave#readme"
+Repository = "https://github.com/AmaLS367/CredWeave"
+Issues = "https://github.com/AmaLS367/CredWeave/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/credweave"]

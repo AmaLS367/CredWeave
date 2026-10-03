@@ -38,8 +38,8 @@ When contributing to CredWeave, please keep our core tenets in mind:
 
 1. **Fork and clone the repository:**
    ```bash
-   git clone https://github.com/credweave/credweave.git
-   cd credweave
+   git clone https://github.com/AmaLS367/CredWeave.git
+   cd CredWeave
    ```
 
 2. **Create and activate a virtual environment:**

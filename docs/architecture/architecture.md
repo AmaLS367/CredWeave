@@ -173,7 +173,7 @@ def __eq__(self, other: object) -> bool:
 
 
 def __hash__(self) -> int:
-    return hash((self.__class__, self.id))
+    return hash((Credential, self.id))
 ```
 **Rationale:**
 Within a managed pool, a credential is an entity whose identity is uniquely determined by its identifier (e.g. `"prod-primary-openai"`). Even if its secrets are rotated in place, it represents the exact same identity for tracking metrics, cooldowns, and leases.
