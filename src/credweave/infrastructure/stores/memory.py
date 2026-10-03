@@ -12,6 +12,16 @@ from credweave.domain.enums import CredentialState, OutcomeType
 from credweave.domain.outcomes import Outcome
 from credweave.infrastructure.clocks.system import SystemClock
 
+STATE_PRECEDENCE: dict[CredentialState, int] = {
+    CredentialState.REVOKED: 0,
+    CredentialState.DISABLED: 1,
+    CredentialState.UNHEALTHY: 2,
+    CredentialState.QUOTA_EXHAUSTED: 3,
+    CredentialState.RATE_LIMITED: 4,
+    CredentialState.COOLDOWN: 5,
+    CredentialState.AVAILABLE: 6,
+}
+
 
 class MemoryStateStore(StateStore):
     """Thread-safe in-memory state store for credential lifecycle and metrics.
@@ -209,185 +219,113 @@ class MemoryStateStore(StateStore):
 
             new_in_flight = max(0, existing.in_flight_leases - 1)
 
-            # Terminal / administrative states
-            if existing.state in (CredentialState.REVOKED, CredentialState.DISABLED):
+            # Administratively disabled credentials ignore outcome state changes
+            if existing.state == CredentialState.DISABLED:
                 self._records[credential_id] = replace(
                     existing,
                     in_flight_leases=new_in_flight,
                 )
                 return
 
-            # UNHEALTHY state cannot be resurrected by late success or transient errors
-            if existing.state == CredentialState.UNHEALTHY:
-                if outcome.type == OutcomeType.AUTH_FAILED:
-                    self._records[credential_id] = replace(
-                        existing,
-                        state=CredentialState.REVOKED,
-                        in_flight_leases=new_in_flight,
-                        consecutive_failures=existing.consecutive_failures + 1,
-                        cooldown_until=None,
-                    )
-                else:
-                    new_failures = (
-                        existing.consecutive_failures + 1
-                        if outcome.is_failure
-                        else existing.consecutive_failures
-                    )
-                    self._records[credential_id] = replace(
-                        existing,
-                        in_flight_leases=new_in_flight,
-                        consecutive_failures=new_failures,
-                    )
-                return
+            # Failure counter accounting:
+            # SUCCESS, RATE_LIMITED, and QUOTA_EXHAUSTED do not count toward consecutive failures.
+            # Only operational/credential failures increment the failure counter.
+            if outcome.type in (
+                OutcomeType.SUCCESS,
+                OutcomeType.RATE_LIMITED,
+                OutcomeType.QUOTA_EXHAUSTED,
+            ):
+                candidate_failures = existing.consecutive_failures
+            else:
+                candidate_failures = existing.consecutive_failures + 1
 
-            # Active cooldown state (RATE_LIMITED, COOLDOWN, QUOTA_EXHAUSTED)
-            is_active_cooldown = existing.state in (
-                CredentialState.RATE_LIMITED,
-                CredentialState.COOLDOWN,
-                CredentialState.QUOTA_EXHAUSTED,
-            ) and (existing.cooldown_until is None or timestamp < existing.cooldown_until)
-            new_cooldown_until: datetime | None = None
+            # Determine target state and cooldown for the incoming outcome
+            outcome_cooldown: datetime | None = None
 
-            if is_active_cooldown:
-                if outcome.type == OutcomeType.AUTH_FAILED:
-                    self._records[credential_id] = replace(
-                        existing,
-                        state=CredentialState.REVOKED,
-                        in_flight_leases=new_in_flight,
-                        consecutive_failures=existing.consecutive_failures + 1,
-                        cooldown_until=None,
-                    )
-                    return
+            if outcome.type == OutcomeType.AUTH_FAILED:
+                target_state = CredentialState.REVOKED
 
-                if outcome.type in (
-                    OutcomeType.CONSECUTIVE_FAILURES_EXCEEDED,
-                    OutcomeType.PERMANENT_FAILURE,
-                ):
-                    self._records[credential_id] = replace(
-                        existing,
-                        state=CredentialState.UNHEALTHY,
-                        in_flight_leases=new_in_flight,
-                        consecutive_failures=existing.consecutive_failures + 1,
-                        cooldown_until=None,
-                    )
-                    return
+            elif outcome.type in (
+                OutcomeType.PERMANENT_FAILURE,
+                OutcomeType.CONSECUTIVE_FAILURES_EXCEEDED,
+            ):
+                target_state = CredentialState.UNHEALTHY
 
-                if outcome.type == OutcomeType.SUCCESS:
-                    # Late SUCCESS from concurrent lease never clears active cooldown
-                    self._records[credential_id] = replace(
-                        existing,
-                        in_flight_leases=new_in_flight,
-                    )
-                    return
-
-                if outcome.type == OutcomeType.RATE_LIMITED:
-                    retry_secs = (
-                        outcome.retry_after
-                        if outcome.retry_after is not None
-                        else self._default_cooldown
-                    )
-                    target_cooldown = timestamp + timedelta(seconds=retry_secs)
-                    new_cooldown_until = (
-                        max(existing.cooldown_until, target_cooldown)
-                        if existing.cooldown_until is not None
-                        else target_cooldown
-                    )
-                    new_state = (
-                        CredentialState.QUOTA_EXHAUSTED
-                        if existing.state == CredentialState.QUOTA_EXHAUSTED
-                        else CredentialState.RATE_LIMITED
-                    )
-                    self._records[credential_id] = replace(
-                        existing,
-                        state=new_state,
-                        in_flight_leases=new_in_flight,
-                        cooldown_until=new_cooldown_until,
-                    )
-                    return
-
-                # Other failures (e.g. transient error) while in cooldown
-                new_failures = existing.consecutive_failures + 1
-                if new_failures >= self._max_consecutive_failures:
-                    new_state = CredentialState.UNHEALTHY
-                    new_cooldown_until = None
-                else:
-                    new_state = existing.state
-                    retry_secs = (
-                        outcome.retry_after
-                        if outcome.retry_after is not None
-                        else self._default_cooldown
-                    )
-                    target_cooldown = timestamp + timedelta(seconds=retry_secs)
-                    new_cooldown_until = (
-                        max(existing.cooldown_until, target_cooldown)
-                        if existing.cooldown_until is not None
-                        else target_cooldown
-                    )
-
-                self._records[credential_id] = replace(
-                    existing,
-                    state=new_state,
-                    in_flight_leases=new_in_flight,
-                    consecutive_failures=new_failures,
-                    cooldown_until=new_cooldown_until,
-                )
-                return
-
-            # AVAILABLE state transitions
-            if outcome.type == OutcomeType.SUCCESS:
-                new_state = CredentialState.AVAILABLE
-                new_consecutive_failures = 0
-                new_cooldown_until = None
-
-            elif outcome.type == OutcomeType.AUTH_FAILED:
-                new_state = CredentialState.REVOKED
-                new_consecutive_failures = existing.consecutive_failures + 1
-                new_cooldown_until = None
+            elif outcome.type == OutcomeType.QUOTA_EXHAUSTED:
+                target_state = CredentialState.QUOTA_EXHAUSTED
+                if outcome.retry_after is not None:
+                    outcome_cooldown = timestamp + timedelta(seconds=outcome.retry_after)
 
             elif outcome.type == OutcomeType.RATE_LIMITED:
-                new_state = CredentialState.RATE_LIMITED
-                new_consecutive_failures = existing.consecutive_failures
+                target_state = CredentialState.RATE_LIMITED
                 retry_secs = (
                     outcome.retry_after
                     if outcome.retry_after is not None
                     else self._default_cooldown
                 )
-                new_cooldown_until = timestamp + timedelta(seconds=retry_secs)
-
-            elif outcome.type == OutcomeType.QUOTA_EXHAUSTED:
-                new_state = CredentialState.QUOTA_EXHAUSTED
-                new_consecutive_failures = existing.consecutive_failures + 1
-                new_cooldown_until = (
-                    timestamp + timedelta(seconds=outcome.retry_after)
-                    if outcome.retry_after is not None
-                    else None
-                )
-
-            elif outcome.type in (
-                OutcomeType.CONSECUTIVE_FAILURES_EXCEEDED,
-                OutcomeType.PERMANENT_FAILURE,
-            ):
-                new_state = CredentialState.UNHEALTHY
-                new_consecutive_failures = existing.consecutive_failures + 1
-                new_cooldown_until = None
+                outcome_cooldown = timestamp + timedelta(seconds=retry_secs)
 
             elif outcome.type == OutcomeType.TRANSIENT_ERROR:
-                new_consecutive_failures = existing.consecutive_failures + 1
-                if new_consecutive_failures >= self._max_consecutive_failures:
-                    new_state = CredentialState.UNHEALTHY
-                    new_cooldown_until = None
+                if candidate_failures >= self._max_consecutive_failures:
+                    target_state = CredentialState.UNHEALTHY
                 else:
-                    new_state = CredentialState.COOLDOWN
+                    target_state = CredentialState.COOLDOWN
                     retry_secs = (
                         outcome.retry_after
                         if outcome.retry_after is not None
                         else self._default_cooldown
                     )
-                    new_cooldown_until = timestamp + timedelta(seconds=retry_secs)
+                    outcome_cooldown = timestamp + timedelta(seconds=retry_secs)
+
+            elif outcome.type == OutcomeType.SUCCESS:
+                target_state = CredentialState.AVAILABLE
 
             else:
-                new_consecutive_failures = existing.consecutive_failures + 1
-                new_state = existing.state
+                if candidate_failures >= self._max_consecutive_failures:
+                    target_state = CredentialState.UNHEALTHY
+                else:
+                    target_state = CredentialState.COOLDOWN
+                    retry_secs = (
+                        outcome.retry_after
+                        if outcome.retry_after is not None
+                        else self._default_cooldown
+                    )
+                    outcome_cooldown = timestamp + timedelta(seconds=retry_secs)
+
+            # Centralized precedence resolution:
+            # Lower rank number represents higher precedence (more severe/restrictive state).
+            existing_prec = STATE_PRECEDENCE[existing.state]
+            target_prec = STATE_PRECEDENCE[target_state]
+
+            new_state = target_state if target_prec < existing_prec else existing.state
+
+            # Consecutive failures: reset on AVAILABLE, otherwise preserve candidate failures
+            new_consecutive_failures = (
+                0 if new_state == CredentialState.AVAILABLE else candidate_failures
+            )
+
+            # Cooldown duration resolution:
+            if new_state in (
+                CredentialState.REVOKED,
+                CredentialState.DISABLED,
+                CredentialState.UNHEALTHY,
+                CredentialState.AVAILABLE,
+            ):
+                new_cooldown_until = None
+            elif new_state == CredentialState.QUOTA_EXHAUSTED and (
+                (outcome.type == OutcomeType.QUOTA_EXHAUSTED and outcome.retry_after is None)
+                or (
+                    existing.state == CredentialState.QUOTA_EXHAUSTED
+                    and existing.cooldown_until is None
+                )
+            ):
+                # Indefinite quota exhaustion takes precedence over timed cooldowns
+                new_cooldown_until = None
+            elif existing.cooldown_until is not None and outcome_cooldown is not None:
+                new_cooldown_until = max(existing.cooldown_until, outcome_cooldown)
+            elif outcome_cooldown is not None:
+                new_cooldown_until = outcome_cooldown
+            else:
                 new_cooldown_until = existing.cooldown_until
 
             self._records[credential_id] = replace(
