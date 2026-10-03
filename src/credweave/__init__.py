@@ -35,6 +35,9 @@ from credweave.domain.errors import (
 from credweave.domain.models import Credential, Lease
 from credweave.domain.outcomes import Outcome
 from credweave.infrastructure.clocks.system import SystemClock
+from credweave.infrastructure.sources.static import StaticSource
+from credweave.infrastructure.stores.memory import MemoryStateStore
+from credweave.strategies.round_robin import RoundRobinStrategy
 
 try:
     __version__ = version("credweave")
@@ -61,15 +64,18 @@ __all__ = [
     "Lease",
     "LeaseError",
     "LeaseExpiredError",
+    "MemoryStateStore",
     "NoCredentialsAvailableError",
     "Outcome",
     "OutcomeType",
     "PoolError",
+    "RoundRobinStrategy",
     "SecretAccessError",
     "SelectionContext",
     "SelectionStrategy",
     "StateStore",
     "StateStoreError",
+    "StaticSource",
     "SystemClock",
     "__version__",
 ]

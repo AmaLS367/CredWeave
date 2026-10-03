@@ -90,6 +90,28 @@ class MockStore:
     ) -> None:
         self.update_state(credential_id, state, cooldown_until=cooldown_until)
 
+    def record_acquire(
+        self,
+        credential_id: str,
+        timestamp: datetime,
+    ) -> None:
+        rec = self._records.get(credential_id)
+        if rec is not None:
+            self._records[credential_id] = CredentialRecord(
+                credential_id=credential_id,
+                state=rec.state,
+                in_flight_leases=rec.in_flight_leases + 1,
+                total_leases=rec.total_leases + 1,
+                last_used_at=timestamp,
+            )
+
+    async def record_acquire_async(
+        self,
+        credential_id: str,
+        timestamp: datetime,
+    ) -> None:
+        self.record_acquire(credential_id, timestamp)
+
     def record_outcome(
         self,
         credential_id: str,

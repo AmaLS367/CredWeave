@@ -1,13 +1,7 @@
 """Credential selection and scheduling strategies.
 
-Future strategies will include:
-    - RoundRobinStrategy
-    - RandomStrategy
-    - WeightedStrategy
-    - LeastUsedStrategy
-    - LeastRecentlyUsedStrategy
-    - FailoverStrategy
-    - QuotaAwareStrategy
+Provided strategies:
+    - RoundRobinStrategy: Cyclic rotation among eligible credentials
 """
 
 from credweave.strategies.base import (
@@ -15,9 +9,11 @@ from credweave.strategies.base import (
     SelectionContext,
     SelectionStrategy,
 )
+from credweave.strategies.round_robin import RoundRobinStrategy
 
 __all__ = [
     "CredentialCandidate",
+    "RoundRobinStrategy",
     "SelectionContext",
     "SelectionStrategy",
 ]

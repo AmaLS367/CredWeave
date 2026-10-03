@@ -76,6 +76,22 @@ class StateStore(Protocol):
         """Update the state and cooldown timer for a credential asynchronously."""
         ...
 
+    def record_acquire(
+        self,
+        credential_id: str,
+        timestamp: datetime,
+    ) -> None:
+        """Record a lease acquisition, incrementing in-flight and total leases synchronously."""
+        ...
+
+    async def record_acquire_async(
+        self,
+        credential_id: str,
+        timestamp: datetime,
+    ) -> None:
+        """Record a lease acquisition asynchronously."""
+        ...
+
     def record_outcome(
         self,
         credential_id: str,

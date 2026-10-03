@@ -26,6 +26,9 @@ def test_top_level_exports() -> None:
     assert CredWeaveError is not None
     assert Clock is not None
     assert SystemClock is not None
+    assert credweave.MemoryStateStore is not None
+    assert credweave.StaticSource is not None
+    assert credweave.RoundRobinStrategy is not None
 
 
 def test_package_version_format() -> None:

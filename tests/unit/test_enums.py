@@ -30,7 +30,8 @@ def test_outcome_type_values() -> None:
     assert OutcomeType.CONSECUTIVE_FAILURES_EXCEEDED.value == "consecutive_failures_exceeded"
 
     # Backward compatibility alias for TRANSIENT_ERROR
-    assert OutcomeType.TEMPORARY_FAILURE is OutcomeType.TRANSIENT_ERROR  # type: ignore[comparison-overlap]
+    temp_failure: object = OutcomeType.TEMPORARY_FAILURE
+    assert temp_failure is OutcomeType.TRANSIENT_ERROR
     assert OutcomeType.TEMPORARY_FAILURE.value == "transient_error"
     assert OutcomeType("temporary_failure") == OutcomeType.TRANSIENT_ERROR
 
