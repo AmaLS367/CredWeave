@@ -12,6 +12,7 @@ from credweave.application.ports.credential_source import CredentialSource
 from credweave.application.ports.state_store import (
     CredentialRecord,
     LeaseRecord,
+    LeaseReservation,
     LeaseSettlement,
     StateStore,
 )
@@ -84,6 +85,7 @@ __all__ = [
     "LeaseError",
     "LeaseExpiredError",
     "LeaseRecord",
+    "LeaseReservation",
     "LeaseSettlement",
     "LeastRecentlyUsedStrategy",
     "LeastUsedStrategy",

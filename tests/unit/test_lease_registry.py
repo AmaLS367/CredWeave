@@ -5,7 +5,12 @@ from datetime import timedelta
 
 import pytest
 
-from credweave.application.ports.state_store import LeaseRecord, LeaseSettlement, StateStore
+from credweave.application.ports.state_store import (
+    LeaseRecord,
+    LeaseReservation,
+    LeaseSettlement,
+    StateStore,
+)
 from credweave.application.services.lifecycle import LifecycleEngine
 from credweave.domain.enums import CredentialState
 from credweave.domain.errors import ConfigurationError, InvalidOutcomeError, StateStoreError
@@ -32,7 +37,7 @@ def test_reserve_lease_registers_lease_and_updates_counters(test_clock: TestCloc
     now = test_clock.now()
     expires = now + timedelta(seconds=30)
 
-    assert store.reserve_lease("c1", "l1", now, expires_at=expires) is True
+    assert store.reserve_lease("c1", "l1", now, expires_at=expires) is LeaseReservation.RESERVED
 
     record = store.get_record("c1")
     assert record is not None
@@ -58,7 +63,9 @@ def test_reserve_lease_refuses_at_capacity_without_side_effects(test_clock: Test
     before = store.get_record("c1")
 
     later = now + timedelta(seconds=5)
-    assert store.reserve_lease("c1", "l2", later, max_concurrency=1) is False
+    result = store.reserve_lease("c1", "l2", later, max_concurrency=1)
+    assert result is LeaseReservation.AT_CAPACITY
+    assert not result
 
     assert store.get_record("c1") == before
     assert [lease.lease_id for lease in store.list_active_leases()] == ["l1"]
@@ -68,7 +75,13 @@ def test_reserve_lease_cap_greater_than_one(test_clock: TestClock) -> None:
     store = _store(test_clock)
     now = test_clock.now()
     results = [store.reserve_lease("c1", f"l{i}", now, max_concurrency=3) for i in range(5)]
-    assert results == [True, True, True, False, False]
+    assert results == [
+        LeaseReservation.RESERVED,
+        LeaseReservation.RESERVED,
+        LeaseReservation.RESERVED,
+        LeaseReservation.AT_CAPACITY,
+        LeaseReservation.AT_CAPACITY,
+    ]
     assert _in_flight(store, "c1") == 3
 
 
@@ -117,8 +130,14 @@ def test_reserve_lease_rejects_invalid_cap(test_clock: TestClock, bad: object) -
 async def test_reserve_lease_async_matches_sync(test_clock: TestClock) -> None:
     store = _store(test_clock)
     now = test_clock.now()
-    assert await store.reserve_lease_async("c1", "l1", now, max_concurrency=1) is True
-    assert await store.reserve_lease_async("c1", "l2", now, max_concurrency=1) is False
+    assert (
+        await store.reserve_lease_async("c1", "l1", now, max_concurrency=1)
+        is LeaseReservation.RESERVED
+    )
+    assert (
+        await store.reserve_lease_async("c1", "l2", now, max_concurrency=1)
+        is LeaseReservation.AT_CAPACITY
+    )
     assert [lease.lease_id for lease in await store.list_active_leases_async()] == ["l1"]
 
 
@@ -399,13 +418,14 @@ def test_concurrent_reserve_never_exceeds_cap(test_clock: TestClock) -> None:
     now = test_clock.now()
     cap = 7
 
-    def attempt(i: int) -> bool:
+    def attempt(i: int) -> LeaseReservation:
         return store.reserve_lease("c1", f"l{i}", now, max_concurrency=cap)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=32) as pool:
         results = list(pool.map(attempt, range(500)))
 
-    assert sum(results) == cap
+    assert results.count(LeaseReservation.RESERVED) == cap
+    assert results.count(LeaseReservation.AT_CAPACITY) == 500 - cap
     assert _in_flight(store, "c1") == cap
     assert len(store.list_active_leases()) == cap
 

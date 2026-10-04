@@ -7,6 +7,7 @@ from credweave.application.ports.credential_source import CredentialSource
 from credweave.application.ports.state_store import (
     CredentialRecord,
     LeaseRecord,
+    LeaseReservation,
     LeaseSettlement,
     StateStore,
 )
@@ -95,62 +96,6 @@ class MockStore:
     ) -> None:
         self.update_state(credential_id, state, cooldown_until=cooldown_until)
 
-    def record_acquire(
-        self,
-        credential_id: str,
-        timestamp: datetime,
-    ) -> None:
-        rec = self._records.get(credential_id)
-        if rec is not None:
-            self._records[credential_id] = CredentialRecord(
-                credential_id=credential_id,
-                state=rec.state,
-                in_flight_leases=rec.in_flight_leases + 1,
-                total_leases=rec.total_leases + 1,
-                last_used_at=timestamp,
-            )
-
-    async def record_acquire_async(
-        self,
-        credential_id: str,
-        timestamp: datetime,
-    ) -> None:
-        self.record_acquire(credential_id, timestamp)
-
-    def record_outcome(
-        self,
-        credential_id: str,
-        outcome: Outcome,
-        timestamp: datetime,
-    ) -> None:
-        pass
-
-    async def record_outcome_async(
-        self,
-        credential_id: str,
-        outcome: Outcome,
-        timestamp: datetime,
-    ) -> None:
-        pass
-
-    def release_lease(
-        self,
-        credential_id: str,
-    ) -> None:
-        rec = self._records.get(credential_id)
-        if rec is not None:
-            self._records[credential_id] = CredentialRecord(
-                credential_id=credential_id,
-                state=rec.state,
-                in_flight_leases=max(0, rec.in_flight_leases - 1),
-            )
-
-    async def release_lease_async(
-        self,
-        credential_id: str,
-    ) -> None:
-        self.release_lease(credential_id)
-
     def reserve_lease(
         self,
         credential_id: str,
@@ -159,8 +104,8 @@ class MockStore:
         *,
         max_concurrency: int | None = None,
         expires_at: datetime | None = None,
-    ) -> bool:
-        return True
+    ) -> LeaseReservation:
+        return LeaseReservation.RESERVED
 
     async def reserve_lease_async(
         self,
@@ -170,8 +115,8 @@ class MockStore:
         *,
         max_concurrency: int | None = None,
         expires_at: datetime | None = None,
-    ) -> bool:
-        return True
+    ) -> LeaseReservation:
+        return LeaseReservation.RESERVED
 
     def settle_lease(
         self,

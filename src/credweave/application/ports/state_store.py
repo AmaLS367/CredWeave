@@ -43,6 +43,29 @@ class LeaseRecord:
     expires_at: datetime | None = None
 
 
+class LeaseReservation(Enum):
+    """Result of trying to reserve a lease slot against the state store.
+
+    Both failure results are *races*, not faults: they are expected when several pools,
+    threads or tasks share a store, they change nothing in the store (in particular no health
+    state) and the caller should simply select another credential.
+    """
+
+    RESERVED = "reserved"
+    """The credential was eligible and had a free slot: the lease is now registered."""
+
+    AT_CAPACITY = "at_capacity"
+    """The credential was eligible but already at its concurrency cap."""
+
+    INELIGIBLE = "ineligible"
+    """The credential's authoritative current state is not ``AVAILABLE`` (revoked, disabled,
+    unhealthy, rate limited, quota exhausted or cooling down)."""
+
+    def __bool__(self) -> bool:
+        """Truthy only when the lease was reserved, so a failure is never mistaken for success."""
+        return self is LeaseReservation.RESERVED
+
+
 class LeaseSettlement(Enum):
     """Result of settling (reporting) a lease against the state store."""
 
@@ -68,7 +91,9 @@ class StateStore(Protocol):
     and execution metrics in-memory, SQLite, or Redis.
 
     Lease slots are managed through a registry owned by the store, so concurrency limits and
-    lease reclamation hold across every pool, thread and task sharing the store. Each method
+    lease reclamation hold across every pool, thread and task sharing the store. The registry
+    is the *only* way to change ``CredentialRecord.in_flight_leases``: the counter is derived
+    from, and always equals, the number of registered leases of that credential. Each method
     of the registry (``reserve_lease``, ``settle_lease``, ``reclaim_expired_leases``) must be
     atomic: it either fully applies or, if it raises, leaves the store unchanged.
     """
@@ -109,54 +134,6 @@ class StateStore(Protocol):
         """Update the state and cooldown timer for a credential asynchronously."""
         ...
 
-    def record_acquire(
-        self,
-        credential_id: str,
-        timestamp: datetime,
-    ) -> None:
-        """Record a lease acquisition, incrementing in-flight and total leases synchronously."""
-        ...
-
-    async def record_acquire_async(
-        self,
-        credential_id: str,
-        timestamp: datetime,
-    ) -> None:
-        """Record a lease acquisition asynchronously."""
-        ...
-
-    def record_outcome(
-        self,
-        credential_id: str,
-        outcome: Outcome,
-        timestamp: datetime,
-    ) -> None:
-        """Record an operation outcome for metrics and state transitions synchronously."""
-        ...
-
-    async def record_outcome_async(
-        self,
-        credential_id: str,
-        outcome: Outcome,
-        timestamp: datetime,
-    ) -> None:
-        """Record an operation outcome for metrics and state transitions asynchronously."""
-        ...
-
-    def release_lease(
-        self,
-        credential_id: str,
-    ) -> None:
-        """Release an in-flight lease without recording an outcome synchronously."""
-        ...
-
-    async def release_lease_async(
-        self,
-        credential_id: str,
-    ) -> None:
-        """Release an in-flight lease without recording an outcome asynchronously."""
-        ...
-
     def reserve_lease(
         self,
         credential_id: str,
@@ -165,14 +142,21 @@ class StateStore(Protocol):
         *,
         max_concurrency: int | None = None,
         expires_at: datetime | None = None,
-    ) -> bool:
-        """Atomically claim a concurrency slot and register the lease synchronously.
+    ) -> LeaseReservation:
+        """Atomically check eligibility and capacity, then register the lease synchronously.
 
-        Checks the credential's in-flight count against ``max_concurrency`` (``None`` means
-        unlimited) and, only if a slot is free, increments in-flight and total leases, stamps
-        ``last_used_at`` and registers ``lease_id`` (reclaimable once ``expires_at`` has
-        passed). The check and the claim are one atomic step. Returns ``False``, changing
-        nothing, when the credential is at capacity.
+        In one atomic step, against the authoritative current record:
+
+        1. a timed cooldown that has elapsed at ``timestamp`` is recovered to ``AVAILABLE``;
+        2. the state must then be ``AVAILABLE``, otherwise ``INELIGIBLE`` is returned;
+        3. the in-flight count must be below ``max_concurrency`` (``None`` means unlimited),
+           otherwise ``AT_CAPACITY`` is returned;
+        4. only then are in-flight and total leases incremented, ``last_used_at`` stamped and
+           ``lease_id`` registered (reclaimable once ``expires_at`` has passed).
+
+        A credential never being seen by the store counts as a fresh ``AVAILABLE`` one. A
+        non-``RESERVED`` result changes nothing: no counter, no registry entry and no health
+        state, so a caller that merely lost a race can safely pick another credential.
 
         Raises:
             ConfigurationError: ``max_concurrency`` is not ``None`` or an integer >= 1.
@@ -188,8 +172,8 @@ class StateStore(Protocol):
         *,
         max_concurrency: int | None = None,
         expires_at: datetime | None = None,
-    ) -> bool:
-        """Atomically claim a concurrency slot and register the lease asynchronously."""
+    ) -> LeaseReservation:
+        """Atomically check eligibility and capacity, then register the lease asynchronously."""
         ...
 
     def settle_lease(

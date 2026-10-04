@@ -12,6 +12,7 @@ from credweave.application.ports.credential_source import CredentialSource
 from credweave.application.ports.state_store import (
     CredentialRecord,
     LeaseRecord,
+    LeaseReservation,
     LeaseSettlement,
     StateStore,
 )
@@ -310,8 +311,9 @@ class CredentialPool:
         """Snapshot the credentials a strategy may choose from.
 
         Credentials at their concurrency cap, and those whose reservation was just lost to a
-        concurrent acquirer (``excluded``), are left out: they are temporarily ineligible and
-        their health state is not touched. Every credential has a record in ``records``.
+        concurrent acquirer or a concurrent state change (``excluded``), are left out: they are
+        temporarily ineligible and their health state is not touched. Every credential has a
+        record in ``records``.
         """
         candidates: list[CredentialCandidate] = []
         for cred in credentials:
@@ -343,10 +345,12 @@ class CredentialPool:
     def acquire_sync(self, context: SelectionContext | None = None) -> Lease:
         """Acquire a credential lease synchronously according to the configured strategy.
 
-        Expired leases are reclaimed first. The chosen credential's concurrency slot is then
-        claimed atomically in the state store; if another acquirer took the last slot between
-        selection and reservation, candidates are refreshed and another eligible credential
-        is selected.
+        Expired leases are reclaimed first. The chosen credential's eligibility and concurrency
+        slot are then verified and claimed atomically in the state store. If another acquirer
+        took the last slot, or a concurrent report changed the credential's state (revoked,
+        rate limited, cooling down...) between selection and reservation, that credential is
+        skipped for this call, candidates are refreshed and another one is selected. Losing
+        such a race never changes a credential's health state.
         """
         with self._pool_lock:
             self._reclaim_sync()
@@ -367,14 +371,16 @@ class CredentialPool:
                     raise NoCredentialsAvailableError("No eligible credentials available in pool.")
 
                 lease = self._new_lease(selected.credential)
-                if self._store.reserve_lease(
+                reservation = self._store.reserve_lease(
                     selected.credential_id,
                     lease.lease_id,
                     lease.acquired_at,
                     max_concurrency=self._concurrency_limit(selected.credential),
                     expires_at=self._expires_at(lease.acquired_at),
-                ):
+                )
+                if reservation is LeaseReservation.RESERVED:
                     return lease
+                # AT_CAPACITY or INELIGIBLE: a lost race, not a credential fault.
                 excluded.add(selected.credential_id)
 
     async def acquire(self, context: SelectionContext | None = None) -> Lease:
@@ -399,14 +405,16 @@ class CredentialPool:
                     raise NoCredentialsAvailableError("No eligible credentials available in pool.")
 
                 lease = self._new_lease(selected.credential)
-                if await self._store.reserve_lease_async(
+                reservation = await self._store.reserve_lease_async(
                     selected.credential_id,
                     lease.lease_id,
                     lease.acquired_at,
                     max_concurrency=self._concurrency_limit(selected.credential),
                     expires_at=self._expires_at(lease.acquired_at),
-                ):
+                )
+                if reservation is LeaseReservation.RESERVED:
                     return lease
+                # AT_CAPACITY or INELIGIBLE: a lost race, not a credential fault.
                 excluded.add(selected.credential_id)
 
     def _initialize_record_sync(self, credential_id: str) -> CredentialRecord:

@@ -2,15 +2,21 @@
 
 import concurrent.futures
 import itertools
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 
 import pytest
 
-from credweave.application.ports.state_store import CredentialRecord, StateStore
+from credweave.application.ports.state_store import (
+    CredentialRecord,
+    LeaseReservation,
+    LeaseSettlement,
+    StateStore,
+)
 from credweave.domain.enums import CredentialState
 from credweave.domain.outcomes import Outcome
 from credweave.infrastructure.stores.memory import MemoryStateStore
 from tests.conftest import TestClock
+from tests.lease_helpers import assert_lease_accounting, open_leases, settle
 
 
 def test_memory_state_store_protocol_conformance(test_clock: TestClock) -> None:
@@ -50,44 +56,61 @@ async def test_get_and_list_records_async(test_clock: TestClock) -> None:
     assert {r.credential_id for r in all_records} == {"c1", "c2"}
 
 
-def test_record_acquire_increments_leases(test_clock: TestClock) -> None:
-    """Verify record_acquire increments in-flight and total leases."""
+def test_reserve_lease_increments_leases(test_clock: TestClock) -> None:
+    """Verify reserving leases increments in-flight and total leases and registers them."""
     store = MemoryStateStore(clock=test_clock)
     now = test_clock.now()
 
-    store.record_acquire("c1", now)
+    assert store.reserve_lease("c1", "l1", now) is LeaseReservation.RESERVED
     rec1 = store.get_record("c1")
     assert rec1 is not None
     assert rec1.in_flight_leases == 1
     assert rec1.total_leases == 1
     assert rec1.last_used_at == now
 
-    store.record_acquire("c1", now)
+    assert store.reserve_lease("c1", "l2", now) is LeaseReservation.RESERVED
     rec2 = store.get_record("c1")
     assert rec2 is not None
     assert rec2.in_flight_leases == 2
     assert rec2.total_leases == 2
+    assert_lease_accounting(store)
 
 
 @pytest.mark.asyncio
-async def test_record_acquire_async(test_clock: TestClock) -> None:
-    """Verify record_acquire_async."""
+async def test_reserve_lease_async(test_clock: TestClock) -> None:
+    """Verify reserve_lease_async registers the lease."""
     store = MemoryStateStore(clock=test_clock)
     now = test_clock.now()
 
-    await store.record_acquire_async("c1", now)
+    assert await store.reserve_lease_async("c1", "l1", now) is LeaseReservation.RESERVED
     rec = await store.get_record_async("c1")
     assert rec is not None
     assert rec.in_flight_leases == 1
+    assert_lease_accounting(store)
 
 
-def test_record_outcome_success(test_clock: TestClock) -> None:
+def test_legacy_counter_mutators_are_gone(test_clock: TestClock) -> None:
+    """The lease registry is the only path that may change in-flight accounting."""
+    store = MemoryStateStore(clock=test_clock)
+    for name in (
+        "record_acquire",
+        "record_acquire_async",
+        "record_outcome",
+        "record_outcome_async",
+        "release_lease",
+        "release_lease_async",
+    ):
+        assert not hasattr(store, name), name
+        assert not hasattr(StateStore, name), name
+
+
+def test_settle_success(test_clock: TestClock) -> None:
     """Verify SUCCESS outcome decrements in-flight, clears failures and cooldown."""
     store = MemoryStateStore(clock=test_clock)
     now = test_clock.now()
 
-    store.record_acquire("c1", now)
-    store.record_outcome("c1", Outcome.success(), now)
+    (lease_id,) = open_leases(store, "c1", 1, now)
+    settle(store, "c1", lease_id, Outcome.success(), now)
 
     rec = store.get_record("c1")
     assert rec is not None
@@ -95,27 +118,28 @@ def test_record_outcome_success(test_clock: TestClock) -> None:
     assert rec.in_flight_leases == 0
     assert rec.consecutive_failures == 0
     assert rec.cooldown_until is None
+    assert_lease_accounting(store)
 
 
-def test_record_outcome_without_prior_record(test_clock: TestClock) -> None:
-    """Verify record_outcome initializes record if not previously present."""
+def test_settle_unknown_lease_creates_no_record(test_clock: TestClock) -> None:
+    """Verify settling a lease that was never reserved changes nothing."""
     store = MemoryStateStore(clock=test_clock)
     now = test_clock.now()
 
-    store.record_outcome("c1", Outcome.success(), now)
-    rec = store.get_record("c1")
-    assert rec is not None
-    assert rec.state == CredentialState.AVAILABLE
-    assert rec.in_flight_leases == 0
+    result = store.settle_lease("ghost", "c1", Outcome.success(), now)
+
+    assert result is LeaseSettlement.UNKNOWN
+    assert store.get_record("c1") is None
+    assert store.list_active_leases() == ()
 
 
-def test_record_outcome_rate_limited_and_recovery(test_clock: TestClock) -> None:
+def test_settle_rate_limited_and_recovery(test_clock: TestClock) -> None:
     """Verify RATE_LIMITED sets cooldown_until and auto-recovers after expiration."""
     store = MemoryStateStore(clock=test_clock)
     now = test_clock.now()
 
-    store.record_acquire("c1", now)
-    store.record_outcome("c1", Outcome.rate_limited(retry_after=20.0), now)
+    (lease_id,) = open_leases(store, "c1", 1, now)
+    settle(store, "c1", lease_id, Outcome.rate_limited(retry_after=20.0), now)
 
     rec = store.get_record("c1")
     assert rec is not None
@@ -137,13 +161,13 @@ def test_record_outcome_rate_limited_and_recovery(test_clock: TestClock) -> None
     assert recovered.cooldown_until is None
 
 
-def test_record_outcome_auth_failed(test_clock: TestClock) -> None:
+def test_settle_auth_failed(test_clock: TestClock) -> None:
     """Verify AUTH_FAILED sets state to REVOKED."""
     store = MemoryStateStore(clock=test_clock)
     now = test_clock.now()
 
-    store.record_acquire("c1", now)
-    store.record_outcome("c1", Outcome.auth_failed(), now)
+    (lease_id,) = open_leases(store, "c1", 1, now)
+    settle(store, "c1", lease_id, Outcome.auth_failed(), now)
 
     rec = store.get_record("c1")
     assert rec is not None
@@ -155,13 +179,13 @@ def test_record_outcome_auth_failed(test_clock: TestClock) -> None:
     assert store.get_record("c1").state == CredentialState.REVOKED  # type: ignore[union-attr]
 
 
-def test_record_outcome_quota_exhausted(test_clock: TestClock) -> None:
+def test_settle_quota_exhausted(test_clock: TestClock) -> None:
     """Verify QUOTA_EXHAUSTED outcome behavior."""
     store = MemoryStateStore(clock=test_clock)
     now = test_clock.now()
 
-    store.record_acquire("c1", now)
-    store.record_outcome("c1", Outcome.quota_exhausted(retry_after=30.0), now)
+    (lease_id,) = open_leases(store, "c1", 1, now)
+    settle(store, "c1", lease_id, Outcome.quota_exhausted(retry_after=30.0), now)
 
     rec = store.get_record("c1")
     assert rec is not None
@@ -173,14 +197,14 @@ def test_record_outcome_quota_exhausted(test_clock: TestClock) -> None:
     assert store.get_record("c1").state == CredentialState.AVAILABLE  # type: ignore[union-attr]
 
 
-def test_record_outcome_repeated_failures_escalate(test_clock: TestClock) -> None:
+def test_settle_repeated_failures_escalate(test_clock: TestClock) -> None:
     """Verify repeated transient errors escalate to UNHEALTHY at threshold."""
     store = MemoryStateStore(clock=test_clock, max_consecutive_failures=2)
     now = test_clock.now()
 
     # Failure 1
-    store.record_acquire("c1", now)
-    store.record_outcome("c1", Outcome.transient_error(retry_after=5.0), now)
+    (lease_id,) = open_leases(store, "c1", 1, now)
+    settle(store, "c1", lease_id, Outcome.transient_error(retry_after=5.0), now)
     assert store.get_record("c1").state == CredentialState.COOLDOWN  # type: ignore[union-attr]
 
     # Advance clock past cooldown
@@ -188,8 +212,8 @@ def test_record_outcome_repeated_failures_escalate(test_clock: TestClock) -> Non
     assert store.get_record("c1").state == CredentialState.AVAILABLE  # type: ignore[union-attr]
 
     # Failure 2 (reaches max=2)
-    store.record_acquire("c1", test_clock.now())
-    store.record_outcome("c1", Outcome.transient_error(retry_after=5.0), test_clock.now())
+    (lease_id,) = open_leases(store, "c1", 1, test_clock.now())
+    settle(store, "c1", lease_id, Outcome.transient_error(retry_after=5.0), test_clock.now())
 
     rec = store.get_record("c1")
     assert rec is not None
@@ -200,8 +224,8 @@ def test_record_outcome_repeated_failures_escalate(test_clock: TestClock) -> Non
 def test_reset_clears_failures_and_unhealthy(test_clock: TestClock) -> None:
     """Verify reset restores credential to AVAILABLE."""
     store = MemoryStateStore(clock=test_clock)
-    store.record_acquire("c1", test_clock.now())
-    store.record_outcome("c1", Outcome.consecutive_failures_exceeded(), test_clock.now())
+    (lease_id,) = open_leases(store, "c1", 1, test_clock.now())
+    settle(store, "c1", lease_id, Outcome.consecutive_failures_exceeded(), test_clock.now())
 
     assert store.get_record("c1").state == CredentialState.UNHEALTHY  # type: ignore[union-attr]
 
@@ -213,56 +237,33 @@ def test_reset_clears_failures_and_unhealthy(test_clock: TestClock) -> None:
 
 
 def test_concurrent_acquire_and_report(test_clock: TestClock) -> None:
-    """Verify thread safety under heavy concurrent acquire and report operations."""
+    """Verify thread safety under heavy concurrent reserve and settle operations."""
     store = MemoryStateStore(clock=test_clock)
     store.initialize_record("c1")
+    now = test_clock.now()
+    lease_ids = [f"l{i}" for i in range(100)]
 
-    def worker(idx: int) -> None:
-        t = datetime.now(timezone.utc)
-        store.record_acquire("c1", t)
-        if idx % 2 == 0:
-            store.record_outcome("c1", Outcome.success(), t)
-        else:
-            store.record_outcome("c1", Outcome.rate_limited(retry_after=1.0), t)
+    def reserve(lease_id: str) -> LeaseReservation:
+        return store.reserve_lease("c1", lease_id, now)
+
+    def report(idx: int) -> LeaseSettlement:
+        outcome = Outcome.success() if idx % 2 == 0 else Outcome.rate_limited(retry_after=1.0)
+        return store.settle_lease(lease_ids[idx], "c1", outcome, now)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        futures = [executor.submit(worker, i) for i in range(100)]
-        for f in futures:
-            f.result()
+        reservations = list(executor.map(reserve, lease_ids))
+    assert all(r is LeaseReservation.RESERVED for r in reservations)
+    assert_lease_accounting(store)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        settlements = list(executor.map(report, range(100)))
+    assert all(s is LeaseSettlement.SETTLED for s in settlements)
 
     rec = store.get_record("c1")
     assert rec is not None
     assert rec.in_flight_leases == 0
     assert rec.total_leases == 100
-
-
-def test_release_lease_decrements_in_flight_without_changing_state(test_clock: TestClock) -> None:
-    """Verify release_lease decrements in-flight leases without altering health or failures."""
-    store = MemoryStateStore(clock=test_clock)
-    now = test_clock.now()
-
-    store.record_acquire("c1", now)
-    assert store.get_record("c1").in_flight_leases == 1  # type: ignore[union-attr]
-
-    store.release_lease("c1")
-    rec = store.get_record("c1")
-    assert rec is not None
-    assert rec.in_flight_leases == 0
-    assert rec.state == CredentialState.AVAILABLE
-    assert rec.consecutive_failures == 0
-
-
-@pytest.mark.asyncio
-async def test_release_lease_async(test_clock: TestClock) -> None:
-    """Verify release_lease_async decrements in-flight leases asynchronously."""
-    store = MemoryStateStore(clock=test_clock)
-    now = test_clock.now()
-
-    store.record_acquire("c1", now)
-    await store.release_lease_async("c1")
-    rec = await store.get_record_async("c1")
-    assert rec is not None
-    assert rec.in_flight_leases == 0
+    assert_lease_accounting(store)
 
 
 def test_late_success_never_resurrects_revoked(test_clock: TestClock) -> None:
@@ -271,12 +272,11 @@ def test_late_success_never_resurrects_revoked(test_clock: TestClock) -> None:
     now = test_clock.now()
 
     # Simulate 2 concurrent leases acquired
-    store.record_acquire("c1", now)
-    store.record_acquire("c1", now)
+    first, second = open_leases(store, "c1", 2, now)
     assert store.get_record("c1").in_flight_leases == 2  # type: ignore[union-attr]
 
     # Lease 1 fails with AUTH_FAILED -> REVOKED
-    store.record_outcome("c1", Outcome.auth_failed(reason="Revoked key"), now)
+    settle(store, "c1", first, Outcome.auth_failed(reason="Revoked key"), now)
     rec1 = store.get_record("c1")
     assert rec1 is not None
     assert rec1.state == CredentialState.REVOKED
@@ -285,7 +285,7 @@ def test_late_success_never_resurrects_revoked(test_clock: TestClock) -> None:
     # Lease 2 finishes slightly later with SUCCESS -> must NOT resurrect REVOKED
     test_clock.advance(1.0)
     later = test_clock.now()
-    store.record_outcome("c1", Outcome.success(), later)
+    settle(store, "c1", second, Outcome.success(), later)
 
     rec2 = store.get_record("c1")
     assert rec2 is not None
@@ -298,17 +298,15 @@ def test_late_success_never_resurrects_unhealthy(test_clock: TestClock) -> None:
     store = MemoryStateStore(clock=test_clock)
     now = test_clock.now()
 
-    # Acquire 2 leases
-    store.record_acquire("c1", now)
-    store.record_acquire("c1", now)
+    first, second = open_leases(store, "c1", 2, now)
 
     # Lease 1 fails permanently -> UNHEALTHY
-    store.record_outcome("c1", Outcome.permanent_failure(reason="Corrupt provider response"), now)
+    settle(store, "c1", first, Outcome.permanent_failure(reason="Corrupt provider response"), now)
     assert store.get_record("c1").state == CredentialState.UNHEALTHY  # type: ignore[union-attr]
 
     # Lease 2 reports late SUCCESS
     test_clock.advance(1.0)
-    store.record_outcome("c1", Outcome.success(), test_clock.now())
+    settle(store, "c1", second, Outcome.success(), test_clock.now())
 
     rec = store.get_record("c1")
     assert rec is not None
@@ -321,11 +319,10 @@ def test_late_success_never_clears_active_rate_limit_cooldown(test_clock: TestCl
     store = MemoryStateStore(clock=test_clock)
     now = test_clock.now()
 
-    store.record_acquire("c1", now)
-    store.record_acquire("c1", now)
+    first, second = open_leases(store, "c1", 2, now)
 
     # Lease 1 hit 429
-    store.record_outcome("c1", Outcome.rate_limited(retry_after=60.0), now)
+    settle(store, "c1", first, Outcome.rate_limited(retry_after=60.0), now)
     rec1 = store.get_record("c1")
     assert rec1 is not None
     assert rec1.state == CredentialState.RATE_LIMITED
@@ -334,7 +331,7 @@ def test_late_success_never_clears_active_rate_limit_cooldown(test_clock: TestCl
 
     # Lease 2 reports late SUCCESS while cooldown is still active
     test_clock.advance(10.0)
-    store.record_outcome("c1", Outcome.success(), test_clock.now())
+    settle(store, "c1", second, Outcome.success(), test_clock.now())
 
     rec2 = store.get_record("c1")
     assert rec2 is not None
@@ -348,11 +345,10 @@ def test_late_success_never_clears_active_transient_cooldown(test_clock: TestClo
     store = MemoryStateStore(clock=test_clock)
     now = test_clock.now()
 
-    store.record_acquire("c1", now)
-    store.record_acquire("c1", now)
+    first, second = open_leases(store, "c1", 2, now)
 
     # Lease 1 hit transient error
-    store.record_outcome("c1", Outcome.transient_error(retry_after=30.0), now)
+    settle(store, "c1", first, Outcome.transient_error(retry_after=30.0), now)
     rec1 = store.get_record("c1")
     assert rec1 is not None
     assert rec1.state == CredentialState.COOLDOWN
@@ -360,7 +356,7 @@ def test_late_success_never_clears_active_transient_cooldown(test_clock: TestClo
 
     # Lease 2 reports late SUCCESS while cooldown is still active
     test_clock.advance(5.0)
-    store.record_outcome("c1", Outcome.success(), test_clock.now())
+    settle(store, "c1", second, Outcome.success(), test_clock.now())
 
     rec2 = store.get_record("c1")
     assert rec2 is not None
@@ -378,8 +374,8 @@ def test_rate_limited_does_not_increment_consecutive_failures_or_trigger_unhealt
     # Repeatedly rate limit 5 times consecutively across cooldown expirations
     for _ in range(5):
         now = test_clock.now()
-        store.record_acquire("c1", now)
-        store.record_outcome("c1", Outcome.rate_limited(retry_after=10.0), now)
+        (lease_id,) = open_leases(store, "c1", 1, now)
+        settle(store, "c1", lease_id, Outcome.rate_limited(retry_after=10.0), now)
 
         rec = store.get_record("c1")
         assert rec is not None
@@ -404,9 +400,9 @@ def test_transient_error_uses_configured_default_cooldown(test_clock: TestClock)
     store = MemoryStateStore(clock=test_clock, default_cooldown=75.0)
     now = test_clock.now()
 
-    store.record_acquire("c1", now)
+    (lease_id,) = open_leases(store, "c1", 1, now)
     # No retry_after passed
-    store.record_outcome("c1", Outcome.transient_error(), now)
+    settle(store, "c1", lease_id, Outcome.transient_error(), now)
 
     rec = store.get_record("c1")
     assert rec is not None
@@ -422,10 +418,9 @@ def test_quota_exhausted_precedence_over_rate_limited(test_clock: TestClock) -> 
 
     # Order 1: RATE_LIMITED then QUOTA_EXHAUSTED
     store1 = MemoryStateStore(clock=test_clock)
-    store1.record_acquire("c1", now)
-    store1.record_acquire("c1", now)
-    store1.record_outcome("c1", Outcome.rate_limited(retry_after=10.0), now)
-    store1.record_outcome("c1", Outcome.quota_exhausted(retry_after=None), now)
+    first, second = open_leases(store1, "c1", 2, now)
+    settle(store1, "c1", first, Outcome.rate_limited(retry_after=10.0), now)
+    settle(store1, "c1", second, Outcome.quota_exhausted(retry_after=None), now)
     rec1 = store1.get_record("c1")
     assert rec1 is not None
     assert rec1.state == CredentialState.QUOTA_EXHAUSTED
@@ -434,10 +429,9 @@ def test_quota_exhausted_precedence_over_rate_limited(test_clock: TestClock) -> 
 
     # Order 2: QUOTA_EXHAUSTED then RATE_LIMITED
     store2 = MemoryStateStore(clock=test_clock)
-    store2.record_acquire("c1", now)
-    store2.record_acquire("c1", now)
-    store2.record_outcome("c1", Outcome.quota_exhausted(retry_after=None), now)
-    store2.record_outcome("c1", Outcome.rate_limited(retry_after=10.0), now)
+    first, second = open_leases(store2, "c1", 2, now)
+    settle(store2, "c1", first, Outcome.quota_exhausted(retry_after=None), now)
+    settle(store2, "c1", second, Outcome.rate_limited(retry_after=10.0), now)
     rec2 = store2.get_record("c1")
     assert rec2 is not None
     assert rec2.state == CredentialState.QUOTA_EXHAUSTED
@@ -453,10 +447,9 @@ def test_quota_exhausted_precedence_over_transient_cooldown(test_clock: TestCloc
 
     # Order A: TRANSIENT_ERROR then QUOTA_EXHAUSTED
     store_a = MemoryStateStore(clock=test_clock)
-    store_a.record_acquire("c1", now)
-    store_a.record_acquire("c1", now)
-    store_a.record_outcome("c1", Outcome.transient_error(retry_after=5.0), now)
-    store_a.record_outcome("c1", Outcome.quota_exhausted(retry_after=None), now)
+    first, second = open_leases(store_a, "c1", 2, now)
+    settle(store_a, "c1", first, Outcome.transient_error(retry_after=5.0), now)
+    settle(store_a, "c1", second, Outcome.quota_exhausted(retry_after=None), now)
     rec_a = store_a.get_record("c1")
     assert rec_a is not None
     assert rec_a.state == CredentialState.QUOTA_EXHAUSTED
@@ -465,10 +458,9 @@ def test_quota_exhausted_precedence_over_transient_cooldown(test_clock: TestCloc
 
     # Order B: QUOTA_EXHAUSTED then TRANSIENT_ERROR
     store_b = MemoryStateStore(clock=test_clock)
-    store_b.record_acquire("c1", now)
-    store_b.record_acquire("c1", now)
-    store_b.record_outcome("c1", Outcome.quota_exhausted(retry_after=None), now)
-    store_b.record_outcome("c1", Outcome.transient_error(retry_after=5.0), now)
+    first, second = open_leases(store_b, "c1", 2, now)
+    settle(store_b, "c1", first, Outcome.quota_exhausted(retry_after=None), now)
+    settle(store_b, "c1", second, Outcome.transient_error(retry_after=5.0), now)
     rec_b = store_b.get_record("c1")
     assert rec_b is not None
     assert rec_b.state == CredentialState.QUOTA_EXHAUSTED
@@ -485,39 +477,40 @@ def test_quota_exhausted_does_not_count_toward_consecutive_failures_or_unhealthy
     store = MemoryStateStore(clock=test_clock, max_consecutive_failures=2)
     now = test_clock.now()
 
-    for _ in range(5):
-        store.record_acquire("c1", now)
-        store.record_outcome("c1", Outcome.quota_exhausted(retry_after=None), now)
+    # An exhausted credential takes no new leases, so every lease is opened up front.
+    leases = open_leases(store, "c1", 11, now)
+
+    for lease_id in leases[:5]:
+        settle(store, "c1", lease_id, Outcome.quota_exhausted(retry_after=None), now)
         rec = store.get_record("c1")
         assert rec is not None
         assert rec.state == CredentialState.QUOTA_EXHAUSTED
         assert rec.consecutive_failures == 0
 
     # 1 transient error followed by quota exhaustion stays at 1 failure; no UNHEALTHY
-    store.record_acquire("c1", now)
-    store.record_outcome("c1", Outcome.transient_error(retry_after=5.0), now)
+    settle(store, "c1", leases[5], Outcome.transient_error(retry_after=5.0), now)
     rec_after_transient = store.get_record("c1")
     assert rec_after_transient is not None
     assert rec_after_transient.consecutive_failures == 1
 
     # Next 5 quota exhaustions do not increment failures to 2 (which would trigger UNHEALTHY)
-    for _ in range(5):
-        store.record_acquire("c1", now)
-        store.record_outcome("c1", Outcome.quota_exhausted(retry_after=None), now)
+    for lease_id in leases[6:]:
+        settle(store, "c1", lease_id, Outcome.quota_exhausted(retry_after=None), now)
         rec = store.get_record("c1")
         assert rec is not None
         assert rec.state == CredentialState.QUOTA_EXHAUSTED
         assert rec.consecutive_failures == 1
+    assert_lease_accounting(store)
 
 
 def test_quota_exhausted_transitions_active_cooldown(test_clock: TestClock) -> None:
     """Verify QUOTA_EXHAUSTED during an active cooldown correctly transitions state."""
     store = MemoryStateStore(clock=test_clock)
     now = test_clock.now()
+    first, second = open_leases(store, "c1", 2, now)
 
     # Step 1: credential enters RATE_LIMITED cooldown
-    store.record_acquire("c1", now)
-    store.record_outcome("c1", Outcome.rate_limited(retry_after=10.0), now)
+    settle(store, "c1", first, Outcome.rate_limited(retry_after=10.0), now)
     rec = store.get_record("c1")
     assert rec is not None
     assert rec.state == CredentialState.RATE_LIMITED
@@ -525,8 +518,7 @@ def test_quota_exhausted_transitions_active_cooldown(test_clock: TestClock) -> N
     # Step 2: during active cooldown, QUOTA_EXHAUSTED arrives (with retry_after)
     test_clock.advance(2.0)
     current_time = test_clock.now()
-    store.record_acquire("c1", current_time)
-    store.record_outcome("c1", Outcome.quota_exhausted(retry_after=30.0), current_time)
+    settle(store, "c1", second, Outcome.quota_exhausted(retry_after=30.0), current_time)
 
     rec2 = store.get_record("c1")
     assert rec2 is not None
@@ -654,12 +646,11 @@ def test_concurrent_outcomes_order_independence(
             clock=test_clock, default_cooldown=60.0, max_consecutive_failures=3
         )
         # Acquire all leases concurrently
-        for _ in range(len(perm)):
-            store.record_acquire("c1", now)
+        lease_ids = open_leases(store, "c1", len(perm), now)
 
         # Report outcomes in permutation order
-        for outcome in perm:
-            store.record_outcome("c1", outcome, now)
+        for lease_id, outcome in zip(lease_ids, perm, strict=True):
+            settle(store, "c1", lease_id, outcome, now)
 
         rec = store.get_record("c1")
         assert rec is not None

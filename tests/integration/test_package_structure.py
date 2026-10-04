@@ -23,6 +23,7 @@ def test_top_level_exports() -> None:
     assert OutcomeType is not None
     assert CredentialState is not None
     assert Lease is not None
+    assert credweave.LeaseReservation is not None
     assert CredWeaveError is not None
     assert Clock is not None
     assert SystemClock is not None

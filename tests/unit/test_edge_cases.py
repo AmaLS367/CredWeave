@@ -7,6 +7,7 @@ import pytest
 from credweave.application.ports.state_store import (
     CredentialRecord,
     LeaseRecord,
+    LeaseReservation,
     LeaseSettlement,
     StateStore,
 )
@@ -27,6 +28,7 @@ from credweave.infrastructure.sources.static import StaticSource
 from credweave.infrastructure.stores.memory import MemoryStateStore
 from credweave.strategies.round_robin import RoundRobinStrategy
 from tests.conftest import TestClock
+from tests.lease_helpers import open_leases, settle
 
 
 class DummyStore(StateStore):
@@ -70,35 +72,7 @@ class DummyStore(StateStore):
     ) -> None:
         self.update_state(credential_id, state, cooldown_until=cooldown_until)
 
-    def record_acquire(self, credential_id: str, timestamp: datetime) -> None:
-        rec = self._records.get(credential_id)
-        if rec:
-            self._records[credential_id] = CredentialRecord(
-                credential_id=credential_id,
-                state=rec.state,
-                in_flight_leases=rec.in_flight_leases + 1,
-            )
-
-    async def record_acquire_async(self, credential_id: str, timestamp: datetime) -> None:
-        self.record_acquire(credential_id, timestamp)
-
-    def record_outcome(
-        self,
-        credential_id: str,
-        outcome: Outcome,
-        timestamp: datetime,
-    ) -> None:
-        pass
-
-    async def record_outcome_async(
-        self,
-        credential_id: str,
-        outcome: Outcome,
-        timestamp: datetime,
-    ) -> None:
-        pass
-
-    def release_lease(self, credential_id: str) -> None:
+    def _release(self, credential_id: str) -> None:
         rec = self._records.get(credential_id)
         if rec:
             self._records[credential_id] = CredentialRecord(
@@ -106,9 +80,6 @@ class DummyStore(StateStore):
                 state=rec.state,
                 in_flight_leases=max(0, rec.in_flight_leases - 1),
             )
-
-    async def release_lease_async(self, credential_id: str) -> None:
-        self.release_lease(credential_id)
 
     # Minimal lease registry: just enough to satisfy the port.
     def reserve_lease(
@@ -119,10 +90,16 @@ class DummyStore(StateStore):
         *,
         max_concurrency: int | None = None,
         expires_at: datetime | None = None,
-    ) -> bool:
-        self.record_acquire(credential_id, timestamp)
+    ) -> LeaseReservation:
+        rec = self._records.get(credential_id)
+        if rec:
+            self._records[credential_id] = CredentialRecord(
+                credential_id=credential_id,
+                state=rec.state,
+                in_flight_leases=rec.in_flight_leases + 1,
+            )
         self._leases[lease_id] = LeaseRecord(lease_id, credential_id, timestamp, expires_at)
-        return True
+        return LeaseReservation.RESERVED
 
     async def reserve_lease_async(
         self,
@@ -132,7 +109,7 @@ class DummyStore(StateStore):
         *,
         max_concurrency: int | None = None,
         expires_at: datetime | None = None,
-    ) -> bool:
+    ) -> LeaseReservation:
         return self.reserve_lease(
             credential_id,
             lease_id,
@@ -154,7 +131,7 @@ class DummyStore(StateStore):
         if lease.credential_id != credential_id:
             return LeaseSettlement.MISMATCH
         del self._leases[lease_id]
-        self.release_lease(credential_id)
+        self._release(credential_id)
         if lease.expires_at is not None and timestamp > lease.expires_at:
             return LeaseSettlement.EXPIRED
         return LeaseSettlement.SETTLED
@@ -264,20 +241,21 @@ def test_memory_state_store_additional_branches(test_clock: TestClock) -> None:
     store.update_state("c1", CredentialState.COOLDOWN, cooldown_until=now)
     assert store.get_record("c1") is not None
 
-    # 4. record_acquire on non-existent record
-    store.record_acquire("brand-new", now)
+    # 4. reserve_lease on non-existent record creates it
+    assert store.reserve_lease("brand-new", "l-new", now) is LeaseReservation.RESERVED
     rec_new = store.get_record("brand-new")
     assert rec_new is not None
     assert rec_new.in_flight_leases == 1
 
     # 5. outcome CONSECUTIVE_FAILURES_EXCEEDED and PERMANENT_FAILURE
-    store.record_outcome("c1", Outcome.permanent_failure(), now)
+    first, second = open_leases(store, "c1", 2, now)
+    settle(store, "c1", first, Outcome.permanent_failure(), now)
     assert store.get_record("c1").state == CredentialState.UNHEALTHY  # type: ignore[union-attr]
 
     # 6. Custom or unknown outcome type
     custom_outcome = Outcome(type=OutcomeType.SUCCESS)
     object.__setattr__(custom_outcome, "type", "custom_unknown")
-    store.record_outcome("c1", custom_outcome, now)
+    settle(store, "c1", second, custom_outcome, now)
 
     # 7. reset non-existent
     store.reset("does-not-exist")
@@ -415,36 +393,43 @@ def test_memory_state_store_precedence_branches(test_clock: TestClock) -> None:
     store = MemoryStateStore(clock=test_clock, max_consecutive_failures=2)
     now = test_clock.now()
 
+    # The state of a credential can change while a lease on it is in flight, so leases are
+    # opened first and the state is then forced, exactly like a concurrent report would.
+
     # 1. DISABLED state ignores outcomes
+    (lease_1,) = open_leases(store, "c1", 1, now)
     store.update_state("c1", CredentialState.DISABLED)
-    store.record_acquire("c1", now)
-    store.record_outcome("c1", Outcome.success(), now)
+    settle(store, "c1", lease_1, Outcome.success(), now)
     assert store.get_record("c1").state == CredentialState.DISABLED  # type: ignore[union-attr]
 
     # 2. UNHEALTHY escalates to REVOKED on AUTH_FAILED
+    (lease_2,) = open_leases(store, "c2", 1, now)
     store.update_state("c2", CredentialState.UNHEALTHY)
-    store.record_outcome("c2", Outcome.auth_failed(), now)
+    settle(store, "c2", lease_2, Outcome.auth_failed(), now)
     assert store.get_record("c2").state == CredentialState.REVOKED  # type: ignore[union-attr]
 
     # 3. Active cooldown escalates to UNHEALTHY on PERMANENT_FAILURE
+    (lease_3,) = open_leases(store, "c3", 1, now)
     store.update_state(
         "c3",
         CredentialState.COOLDOWN,
         cooldown_until=now + timedelta(seconds=60),
     )
-    store.record_outcome("c3", Outcome.permanent_failure(), now)
+    settle(store, "c3", lease_3, Outcome.permanent_failure(), now)
     assert store.get_record("c3").state == CredentialState.UNHEALTHY  # type: ignore[union-attr]
 
     # 4. Active cooldown escalates to REVOKED on AUTH_FAILED
+    (lease_4,) = open_leases(store, "c4", 1, now)
     store.update_state(
         "c4",
         CredentialState.RATE_LIMITED,
         cooldown_until=now + timedelta(seconds=60),
     )
-    store.record_outcome("c4", Outcome.auth_failed(), now)
+    settle(store, "c4", lease_4, Outcome.auth_failed(), now)
     assert store.get_record("c4").state == CredentialState.REVOKED  # type: ignore[union-attr]
 
     # 5. Active cooldown transient failure exceeding max_consecutive_failures -> UNHEALTHY
+    (lease_5,) = open_leases(store, "c5", 1, now)
     store.update_state(
         "c5",
         CredentialState.COOLDOWN,
@@ -456,7 +441,7 @@ def test_memory_state_store_precedence_branches(test_clock: TestClock) -> None:
     object.__setattr__(rec, "consecutive_failures", 1)
     store._records["c5"] = rec
     # Second failure reaches max=2
-    store.record_outcome("c5", Outcome.transient_error(retry_after=10.0), now)
+    settle(store, "c5", lease_5, Outcome.transient_error(retry_after=10.0), now)
     assert store.get_record("c5").state == CredentialState.UNHEALTHY  # type: ignore[union-attr]
 
 

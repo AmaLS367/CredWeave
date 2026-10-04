@@ -12,6 +12,7 @@ from credweave.application.ports.clock import Clock
 from credweave.application.ports.state_store import (
     CredentialRecord,
     LeaseRecord,
+    LeaseReservation,
     LeaseSettlement,
     StateStore,
 )
@@ -38,9 +39,12 @@ class MemoryStateStore(StateStore):
 
     Lease slots are tracked in a registry guarded by the same lock as the credential records,
     so slot reservation, settlement and expiry reclamation are atomic across threads, asyncio
-    tasks and every pool sharing the store. Leases carry an optional deadline; expired leases
-    are found through a min-heap, so reclamation costs O(log n) per reclaimed lease and
-    O(1) when nothing is due.
+    tasks and every pool sharing the store. The registry is the only writer of
+    ``in_flight_leases``, so that counter always equals the number of registered leases of the
+    credential. Reservation re-checks the credential's lifecycle state and the concurrency cap
+    under that lock, so a state change racing a selection can never let an ineligible
+    credential be leased. Leases carry an optional deadline; expired leases are found through
+    a min-heap, so reclamation costs O(log n) per reclaimed lease and O(1) when nothing is due.
     """
 
     _TOMBSTONE_LIMIT = 4096
@@ -163,49 +167,6 @@ class MemoryStateStore(StateStore):
         """Update the state and cooldown timer for a credential asynchronously."""
         self.update_state(credential_id, state, cooldown_until=cooldown_until)
 
-    def record_acquire(
-        self,
-        credential_id: str,
-        timestamp: datetime,
-    ) -> None:
-        """Record a lease acquisition, incrementing in-flight and total leases synchronously."""
-        with self._lock:
-            existing = self._records.get(credential_id)
-            if existing is None:
-                self._records[credential_id] = CredentialRecord(
-                    credential_id=credential_id,
-                    state=CredentialState.AVAILABLE,
-                    in_flight_leases=1,
-                    total_leases=1,
-                    last_used_at=timestamp,
-                )
-            else:
-                self._records[credential_id] = replace(
-                    existing,
-                    in_flight_leases=existing.in_flight_leases + 1,
-                    total_leases=existing.total_leases + 1,
-                    last_used_at=timestamp,
-                )
-
-    async def record_acquire_async(
-        self,
-        credential_id: str,
-        timestamp: datetime,
-    ) -> None:
-        """Record a lease acquisition asynchronously."""
-        self.record_acquire(credential_id, timestamp)
-
-    def release_lease(self, credential_id: str) -> None:
-        """Release an in-flight lease without applying an outcome synchronously."""
-        with self._lock:
-            existing = self._records.get(credential_id)
-            if existing is not None:
-                self._records[credential_id] = self._lifecycle.release(existing, self._clock.now())
-
-    async def release_lease_async(self, credential_id: str) -> None:
-        """Release an in-flight lease without applying an outcome asynchronously."""
-        self.release_lease(credential_id)
-
     def reserve_lease(
         self,
         credential_id: str,
@@ -214,41 +175,49 @@ class MemoryStateStore(StateStore):
         *,
         max_concurrency: int | None = None,
         expires_at: datetime | None = None,
-    ) -> bool:
-        """Atomically claim a concurrency slot and register the lease synchronously."""
+    ) -> LeaseReservation:
+        """Atomically check eligibility and capacity, then register the lease synchronously."""
         limit = validate_max_concurrency(max_concurrency, "max_concurrency")
         with self._lock:
             if lease_id in self._leases:
                 raise StateStoreError(f"Lease {lease_id!r} is already registered.")
+
             existing = self._records.get(credential_id)
-            in_flight = existing.in_flight_leases if existing is not None else 0
-            if limit is not None and in_flight >= limit:
-                return False
             if existing is None:
-                self._records[credential_id] = CredentialRecord(
+                current = CredentialRecord(
                     credential_id=credential_id,
                     state=CredentialState.AVAILABLE,
-                    in_flight_leases=1,
-                    total_leases=1,
-                    last_used_at=timestamp,
                 )
             else:
-                self._records[credential_id] = replace(
-                    existing,
-                    in_flight_leases=in_flight + 1,
-                    total_leases=existing.total_leases + 1,
-                    last_used_at=timestamp,
-                )
-            self._leases[lease_id] = LeaseRecord(
+                # The authoritative state is read here, under the lock, never trusted from a
+                # caller's earlier snapshot. An elapsed cooldown is recovered using the
+                # reservation timestamp, but only persisted below when the lease is granted.
+                admitted = self._lifecycle.admit(existing, timestamp)
+                if admitted is None:
+                    return LeaseReservation.INELIGIBLE
+                current = admitted
+            if limit is not None and current.in_flight_leases >= limit:
+                return LeaseReservation.AT_CAPACITY
+
+            lease = LeaseRecord(
                 lease_id=lease_id,
                 credential_id=credential_id,
                 acquired_at=timestamp,
                 expires_at=expires_at,
             )
             if expires_at is not None:
+                # Indexed first: an unorderable deadline raises before anything is mutated.
                 heapq.heappush(self._expiry_heap, (expires_at, next(self._heap_counter), lease_id))
+            self._records[credential_id] = replace(
+                current,
+                in_flight_leases=current.in_flight_leases + 1,
+                total_leases=current.total_leases + 1,
+                last_used_at=timestamp,
+            )
+            self._leases[lease_id] = lease
+            if expires_at is not None:
                 self._compact_expiry_heap()
-            return True
+            return LeaseReservation.RESERVED
 
     async def reserve_lease_async(
         self,
@@ -258,8 +227,8 @@ class MemoryStateStore(StateStore):
         *,
         max_concurrency: int | None = None,
         expires_at: datetime | None = None,
-    ) -> bool:
-        """Atomically claim a concurrency slot and register the lease asynchronously."""
+    ) -> LeaseReservation:
+        """Atomically check eligibility and capacity, then register the lease asynchronously."""
         return self.reserve_lease(
             credential_id,
             lease_id,
@@ -364,33 +333,6 @@ class MemoryStateStore(StateStore):
             if lease.expires_at is not None
         ]
         heapq.heapify(self._expiry_heap)
-
-    def record_outcome(
-        self,
-        credential_id: str,
-        outcome: Outcome,
-        timestamp: datetime,
-    ) -> None:
-        """Record an operation outcome; the lifecycle engine decides the transition."""
-        with self._lock:
-            existing = self._records.get(credential_id)
-            if existing is None:
-                existing = CredentialRecord(
-                    credential_id=credential_id,
-                    state=CredentialState.AVAILABLE,
-                )
-            self._records[credential_id] = self._lifecycle.apply_outcome(
-                existing, outcome, timestamp
-            )
-
-    async def record_outcome_async(
-        self,
-        credential_id: str,
-        outcome: Outcome,
-        timestamp: datetime,
-    ) -> None:
-        """Record an operation outcome asynchronously."""
-        self.record_outcome(credential_id, outcome, timestamp)
 
     def reset(self, credential_id: str) -> None:
         """Reset a credential's state to AVAILABLE, clearing failures and cooldown."""

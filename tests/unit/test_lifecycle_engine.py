@@ -310,14 +310,53 @@ def test_disabled_credentials_ignore_outcomes_but_release_leases(test_clock: Tes
     assert rec.consecutive_failures == 0
 
 
-def test_release_decrements_and_recovers_without_going_negative(test_clock: TestClock) -> None:
+def test_release_is_gone_from_the_engine() -> None:
+    assert not hasattr(LifecycleEngine, "release")
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        CredentialState.REVOKED,
+        CredentialState.DISABLED,
+        CredentialState.UNHEALTHY,
+        CredentialState.QUOTA_EXHAUSTED,
+    ],
+)
+def test_admit_rejects_non_timed_ineligible_states_forever(
+    test_clock: TestClock, state: CredentialState
+) -> None:
+    record = CredentialRecord(credential_id="c1", state=state)
+    far_future = test_clock.now() + timedelta(days=365)
+    assert LifecycleEngine().admit(record, far_future) is None
+
+
+@pytest.mark.parametrize(
+    "state",
+    [CredentialState.COOLDOWN, CredentialState.RATE_LIMITED, CredentialState.QUOTA_EXHAUSTED],
+)
+def test_admit_recovers_elapsed_timed_cooldowns_and_rejects_active_ones(
+    test_clock: TestClock, state: CredentialState
+) -> None:
     now = test_clock.now()
+    deadline = now + timedelta(seconds=30)
+    record = CredentialRecord(
+        credential_id="c1", state=state, cooldown_until=deadline, consecutive_failures=2
+    )
     engine = LifecycleEngine()
-    cooling = engine.apply_outcome(fresh(2), Outcome.transient_error(retry_after=5.0), now)
-    released = engine.release(cooling, now + timedelta(seconds=10))
-    assert released.in_flight_leases == 0
-    assert released.state == CredentialState.AVAILABLE
-    assert engine.release(released, now).in_flight_leases == 0
+
+    assert engine.admit(record, deadline - timedelta(microseconds=1)) is None
+    admitted = engine.admit(record, deadline)
+    assert admitted is not None
+    assert admitted.state == CredentialState.AVAILABLE
+    assert admitted.cooldown_until is None
+    assert admitted.consecutive_failures == 2  # the probe window keeps the failure counter
+
+
+def test_admit_returns_available_records_untouched(test_clock: TestClock) -> None:
+    record = fresh(3)
+    admitted = LifecycleEngine().admit(record, test_clock.now())
+    assert admitted is record
 
 
 def test_unknown_outcome_type_is_treated_as_generic_failure(test_clock: TestClock) -> None:

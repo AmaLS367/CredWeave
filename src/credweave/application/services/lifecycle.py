@@ -122,10 +122,16 @@ class LifecycleEngine:
             return replace(record, state=CredentialState.AVAILABLE, cooldown_until=None)
         return record
 
-    def release(self, record: CredentialRecord, now: datetime) -> CredentialRecord:
-        """Return ``record`` after releasing one in-flight lease without an outcome."""
+    def admit(self, record: CredentialRecord, now: datetime) -> CredentialRecord | None:
+        """Return the record as it may take a new lease at ``now``, or ``None`` if it may not.
+
+        A timed cooldown that has elapsed is recovered first; the result must then be
+        ``AVAILABLE``. Any other state (REVOKED, DISABLED, UNHEALTHY, QUOTA_EXHAUSTED, or a
+        RATE_LIMITED / COOLDOWN whose deadline has not passed) is not eligible. Concurrency
+        capacity is a separate concern and is checked by the store, not the lifecycle engine.
+        """
         recovered = self.recover(record, now)
-        return replace(recovered, in_flight_leases=max(0, recovered.in_flight_leases - 1))
+        return recovered if recovered.state == CredentialState.AVAILABLE else None
 
     @staticmethod
     def reclaim(record: CredentialRecord) -> CredentialRecord:
