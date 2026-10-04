@@ -38,7 +38,12 @@ from credweave.domain.outcomes import Outcome
 from credweave.infrastructure.clocks.system import SystemClock
 from credweave.infrastructure.sources.static import StaticSource
 from credweave.infrastructure.stores.memory import MemoryStateStore
+from credweave.strategies.failover import FailoverStrategy
+from credweave.strategies.least_used import LeastUsedStrategy
+from credweave.strategies.lru import LeastRecentlyUsedStrategy
+from credweave.strategies.random_strategy import RandomStrategy
 from credweave.strategies.round_robin import RoundRobinStrategy
+from credweave.strategies.weighted import WeightedStrategy
 
 # Wire default adapters into application services at composition root
 configure_default_adapters()
@@ -64,16 +69,20 @@ __all__ = [
     "CredentialSource",
     "CredentialSourceError",
     "CredentialState",
+    "FailoverStrategy",
     "InvalidLeaseError",
     "InvalidOutcomeError",
     "Lease",
     "LeaseError",
     "LeaseExpiredError",
+    "LeastRecentlyUsedStrategy",
+    "LeastUsedStrategy",
     "MemoryStateStore",
     "NoCredentialsAvailableError",
     "Outcome",
     "OutcomeType",
     "PoolError",
+    "RandomStrategy",
     "RoundRobinStrategy",
     "SecretAccessError",
     "SelectionContext",
@@ -82,5 +91,6 @@ __all__ = [
     "StateStoreError",
     "StaticSource",
     "SystemClock",
+    "WeightedStrategy",
     "__version__",
 ]

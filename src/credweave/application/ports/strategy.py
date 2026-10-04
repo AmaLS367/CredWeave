@@ -19,6 +19,8 @@ class CredentialCandidate:
     in_flight_leases: int = 0
     consecutive_failures: int = 0
     cooldown_until: datetime | None = None
+    total_leases: int = 0
+    last_used_at: datetime | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -61,14 +63,8 @@ class SelectionContext:
 class SelectionStrategy(Protocol):
     """Protocol for scheduling and selection algorithms.
 
-    Future implementations include:
-        - Round-Robin
-        - Random
-        - Weighted
-        - Least-Used
-        - Least-Recently-Used
-        - Failover (priority order)
-        - Quota-Aware
+    Built-in implementations: Round-Robin, Random, Weighted, Least-Used,
+    Least-Recently-Used and Failover (priority order). Quota-Aware is planned.
     """
 
     @property

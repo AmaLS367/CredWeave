@@ -16,12 +16,12 @@ This document outlines the planned capabilities and feature roadmap for **CredWe
 ---
 
 ## Selection & Scheduling Strategies
-- [ ] `RoundRobinStrategy`: Even cyclic rotation among eligible credentials.
-- [ ] `WeightedStrategy`: Traffic allocation based on credential weights or quota capacities.
-- [ ] `LeastUsedStrategy`: Prioritizing credentials with lowest total usage count.
-- [ ] `LeastRecentlyUsedStrategy` (LRU): Maximizing recovery and idle time between uses.
-- [ ] `FailoverStrategy`: Strict priority-based cascading fallback groups.
-- [ ] `RandomStrategy`: Randomized selection with optional weights.
+- [x] `RoundRobinStrategy`: Even cyclic rotation among eligible credentials.
+- [x] `WeightedStrategy`: Traffic allocation based on credential weights or quota capacities.
+- [x] `LeastUsedStrategy`: Prioritizing credentials with lowest total usage count.
+- [x] `LeastRecentlyUsedStrategy` (LRU): Maximizing recovery and idle time between uses.
+- [x] `FailoverStrategy`: Strict priority-based cascading fallback groups.
+- [x] `RandomStrategy`: Randomized selection with optional weights.
 
 ---
 

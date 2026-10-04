@@ -8,13 +8,15 @@ from credweave.application.ports.strategy import (
     SelectionContext,
     SelectionStrategy,
 )
+from credweave.strategies._eligibility import select_eligible
 
 
 class RoundRobinStrategy(SelectionStrategy):
     """Selects eligible credentials in cyclic round-robin order.
 
-    Thread-safe and deterministic. Automatically skips candidates that are not
-    in the AVAILABLE state or do not satisfy selection context requirements.
+    Thread-safe and deterministic. Candidates are filtered through the shared eligibility
+    rules (AVAILABLE state, required tags, preferred metadata). If the previously selected
+    credential has left the candidate list, rotation restarts from the first eligible one.
     """
 
     def __init__(self) -> None:
@@ -32,54 +34,23 @@ class RoundRobinStrategy(SelectionStrategy):
         context: SelectionContext | None = None,
     ) -> CredentialCandidate | None:
         """Select the next eligible candidate according to round-robin order."""
-        if not candidates:
-            return None
-
-        # Filter candidates by availability and selection context requirements
-        eligible: list[CredentialCandidate] = []
-        for candidate in candidates:
-            if not candidate.is_available:
-                continue
-
-            if context is not None and context.required_tags:
-                tags = candidate.credential.get_metadata("tags")
-                if tags is None:
-                    continue
-                if isinstance(tags, str):
-                    candidate_tags = {tags}
-                elif isinstance(tags, (set, frozenset, list, tuple)):
-                    candidate_tags = set(tags)
-                else:
-                    continue
-
-                if not context.required_tags.issubset(candidate_tags):
-                    continue
-
-            eligible.append(candidate)
-
+        eligible = select_eligible(candidates, context)
         if not eligible:
             return None
 
+        eligible_by_id = {c.credential_id: c for c in eligible}
+        candidate_ids = [c.credential_id for c in candidates]
+
         with self._lock:
-            # If no previous selection or single candidate, select the first eligible
-            if self._last_selected_id is None or len(eligible) == 1:
-                chosen = eligible[0]
-                self._last_selected_id = chosen.credential_id
-                return chosen
-
-            # Find the position of the last selected credential in the candidates list
-            candidate_ids = [c.credential_id for c in candidates]
-            if self._last_selected_id in candidate_ids:
-                start_index = (candidate_ids.index(self._last_selected_id) + 1) % len(candidates)
-                eligible_map = {c.credential_id: c for c in eligible}
-                for i in range(len(candidates)):
-                    curr_id = candidate_ids[(start_index + i) % len(candidates)]
-                    if curr_id in eligible_map:
-                        chosen = eligible_map[curr_id]
-                        self._last_selected_id = chosen.credential_id
-                        return chosen
-
-            # Fallback if last selected credential is no longer in the candidates list
             chosen = eligible[0]
+            # Resume the cycle right after the last pick, wrapping around the full candidate
+            # list so ineligible or removed credentials never disturb the rotation order.
+            if self._last_selected_id in candidate_ids:
+                start = candidate_ids.index(self._last_selected_id) + 1
+                for offset in range(len(candidate_ids)):
+                    found = eligible_by_id.get(candidate_ids[(start + offset) % len(candidate_ids)])
+                    if found is not None:
+                        chosen = found
+                        break
             self._last_selected_id = chosen.credential_id
             return chosen

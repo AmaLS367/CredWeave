@@ -238,6 +238,8 @@ class CredentialPool:
                         in_flight_leases=rec.in_flight_leases,
                         consecutive_failures=rec.consecutive_failures,
                         cooldown_until=rec.cooldown_until,
+                        total_leases=rec.total_leases,
+                        last_used_at=rec.last_used_at,
                         metadata=rec.metadata,
                     )
                 )
@@ -291,6 +293,8 @@ class CredentialPool:
                         in_flight_leases=rec.in_flight_leases,
                         consecutive_failures=rec.consecutive_failures,
                         cooldown_until=rec.cooldown_until,
+                        total_leases=rec.total_leases,
+                        last_used_at=rec.last_used_at,
                         metadata=rec.metadata,
                     )
                 )
