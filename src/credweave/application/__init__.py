@@ -2,7 +2,12 @@
 
 from credweave.application.ports.clock import Clock
 from credweave.application.ports.credential_source import CredentialSource
-from credweave.application.ports.state_store import CredentialRecord, StateStore
+from credweave.application.ports.state_store import (
+    CredentialRecord,
+    LeaseRecord,
+    LeaseSettlement,
+    StateStore,
+)
 from credweave.application.ports.strategy import (
     CredentialCandidate,
     SelectionContext,
@@ -17,6 +22,8 @@ __all__ = [
     "CredentialPool",
     "CredentialRecord",
     "CredentialSource",
+    "LeaseRecord",
+    "LeaseSettlement",
     "LifecycleEngine",
     "SelectionContext",
     "SelectionStrategy",

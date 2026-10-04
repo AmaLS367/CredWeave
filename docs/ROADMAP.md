@@ -37,8 +37,8 @@ This document outlines the planned capabilities and feature roadmap for **CredWe
 ## Concurrency & Lease Management
 - [x] Thread-safe and `asyncio`-safe in-memory state tracking (`MemoryStateStore`).
 - [x] Dual synchronous (`pool.acquire_sync()`, `pool.report_sync()`) and asynchronous (`await pool.acquire()`, `await pool.report()`) ergonomics.
-- [ ] Per-credential concurrency caps (limiting in-flight parallel leases).
-- [ ] Lease timeout tracking and automatic reclamation of orphaned leases.
+- [x] Per-credential concurrency caps (limiting in-flight parallel leases): a pool-wide `max_concurrency_per_credential` default with a per-credential `max_concurrency` metadata override, enforced by an atomic slot reservation in the state store.
+- [x] Lease timeout tracking and automatic reclamation of orphaned leases: with `lease_timeout` set, expired leases release their concurrency slot automatically during acquire/report (or explicitly via `reclaim_expired_leases()`), without applying an outcome or changing credential health.
 
 ---
 

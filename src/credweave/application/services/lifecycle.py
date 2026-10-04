@@ -127,6 +127,15 @@ class LifecycleEngine:
         recovered = self.recover(record, now)
         return replace(recovered, in_flight_leases=max(0, recovered.in_flight_leases - 1))
 
+    @staticmethod
+    def reclaim(record: CredentialRecord) -> CredentialRecord:
+        """Return ``record`` after reclaiming one orphaned or expired lease slot.
+
+        Only in-flight accounting changes: reclamation is not an outcome, so health state,
+        failure counter and cooldown are preserved exactly.
+        """
+        return replace(record, in_flight_leases=max(0, record.in_flight_leases - 1))
+
     def apply_outcome(
         self,
         record: CredentialRecord,

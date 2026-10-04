@@ -9,7 +9,12 @@ from importlib.metadata import PackageNotFoundError, version
 from credweave._internal.composition import configure_default_adapters
 from credweave.application.ports.clock import Clock
 from credweave.application.ports.credential_source import CredentialSource
-from credweave.application.ports.state_store import CredentialRecord, StateStore
+from credweave.application.ports.state_store import (
+    CredentialRecord,
+    LeaseRecord,
+    LeaseSettlement,
+    StateStore,
+)
 from credweave.application.ports.strategy import (
     CredentialCandidate,
     SelectionContext,
@@ -78,6 +83,8 @@ __all__ = [
     "Lease",
     "LeaseError",
     "LeaseExpiredError",
+    "LeaseRecord",
+    "LeaseSettlement",
     "LeastRecentlyUsedStrategy",
     "LeastUsedStrategy",
     "LifecycleEngine",

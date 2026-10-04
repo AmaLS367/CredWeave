@@ -173,6 +173,21 @@ stateDiagram-v2
 3. **Report:** The client returns the `Lease` along with a standardized `Outcome` (`success`, `rate_limited`, `auth_failed`, `transient_error`).
 4. **Transition:** The state store updates credential state, adjusts backoff timers, or escalates health flags.
 
+### Concurrency caps and lease timeouts
+
+```python
+pool = CredentialPool(
+    [
+        Credential("primary", secrets={"api_key": "..."}, metadata={"max_concurrency": 2}),
+        Credential("backup", secrets={"api_key": "..."}),
+    ],
+    max_concurrency_per_credential=5,  # default cap; None (the default) means unlimited
+    lease_timeout=60.0,  # unreported leases are reclaimed after 60 s
+)
+```
+
+A credential at its cap is skipped (its health is untouched) until a slot frees up, and the cap is enforced atomically in the state store, so it holds across threads, asyncio tasks and pools sharing one store. Leases that are never reported are reclaimed automatically on the next `acquire`/`report`, or on demand with `pool.reclaim_expired_leases()`; a late `report` of a reclaimed lease raises `LeaseExpiredError`.
+
 ---
 
 ## 🛡️ Security & Zero-Leak Guarantees

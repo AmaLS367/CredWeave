@@ -419,3 +419,22 @@ def test_concurrent_outcomes_are_order_independent(
         assert rec.in_flight_leases == 0
         results.append(rec)
     assert all(r == results[0] for r in results)
+
+
+def test_reclaim_only_decrements_in_flight(test_clock: TestClock) -> None:
+    """Reclaiming an orphaned lease slot never touches health, failures or cooldown."""
+    engine = LifecycleEngine()
+    deadline = test_clock.now() + timedelta(seconds=30)
+    record = CredentialRecord(
+        credential_id="c1",
+        state=CredentialState.COOLDOWN,
+        in_flight_leases=2,
+        consecutive_failures=2,
+        cooldown_until=deadline,
+        total_leases=9,
+    )
+
+    reclaimed = engine.reclaim(record)
+
+    assert reclaimed == replace(record, in_flight_leases=1)
+    assert engine.reclaim(replace(record, in_flight_leases=0)).in_flight_leases == 0

@@ -4,7 +4,12 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from credweave.application.ports.state_store import CredentialRecord, StateStore
+from credweave.application.ports.state_store import (
+    CredentialRecord,
+    LeaseRecord,
+    LeaseSettlement,
+    StateStore,
+)
 from credweave.application.ports.strategy import CredentialCandidate, SelectionContext
 from credweave.application.services.pool import CredentialPool
 from credweave.domain.enums import CredentialState, OutcomeType
@@ -29,6 +34,7 @@ class DummyStore(StateStore):
 
     def __init__(self) -> None:
         self._records: dict[str, CredentialRecord] = {}
+        self._leases: dict[str, LeaseRecord] = {}
 
     def get_record(self, credential_id: str) -> CredentialRecord | None:
         return self._records.get(credential_id)
@@ -103,6 +109,76 @@ class DummyStore(StateStore):
 
     async def release_lease_async(self, credential_id: str) -> None:
         self.release_lease(credential_id)
+
+    # Minimal lease registry: just enough to satisfy the port.
+    def reserve_lease(
+        self,
+        credential_id: str,
+        lease_id: str,
+        timestamp: datetime,
+        *,
+        max_concurrency: int | None = None,
+        expires_at: datetime | None = None,
+    ) -> bool:
+        self.record_acquire(credential_id, timestamp)
+        self._leases[lease_id] = LeaseRecord(lease_id, credential_id, timestamp, expires_at)
+        return True
+
+    async def reserve_lease_async(
+        self,
+        credential_id: str,
+        lease_id: str,
+        timestamp: datetime,
+        *,
+        max_concurrency: int | None = None,
+        expires_at: datetime | None = None,
+    ) -> bool:
+        return self.reserve_lease(
+            credential_id,
+            lease_id,
+            timestamp,
+            max_concurrency=max_concurrency,
+            expires_at=expires_at,
+        )
+
+    def settle_lease(
+        self,
+        lease_id: str,
+        credential_id: str,
+        outcome: Outcome,
+        timestamp: datetime,
+    ) -> LeaseSettlement:
+        lease = self._leases.get(lease_id)
+        if lease is None:
+            return LeaseSettlement.UNKNOWN
+        if lease.credential_id != credential_id:
+            return LeaseSettlement.MISMATCH
+        del self._leases[lease_id]
+        self.release_lease(credential_id)
+        if lease.expires_at is not None and timestamp > lease.expires_at:
+            return LeaseSettlement.EXPIRED
+        return LeaseSettlement.SETTLED
+
+    async def settle_lease_async(
+        self,
+        lease_id: str,
+        credential_id: str,
+        outcome: Outcome,
+        timestamp: datetime,
+    ) -> LeaseSettlement:
+        return self.settle_lease(lease_id, credential_id, outcome, timestamp)
+
+    def reclaim_expired_leases(self, now: datetime) -> tuple[LeaseRecord, ...]:
+        return ()
+
+    async def reclaim_expired_leases_async(self, now: datetime) -> tuple[LeaseRecord, ...]:
+        return ()
+
+    def list_active_leases(self) -> tuple[LeaseRecord, ...]:
+        return tuple(self._leases.values())
+
+    async def list_active_leases_async(self) -> tuple[LeaseRecord, ...]:
+        return self.list_active_leases()
 
 
 def test_pool_with_dummy_store_branches(sample_credential: Credential) -> None:
@@ -283,7 +359,7 @@ def test_expired_lease_release_failure_restores_active_lease(
     sample_credential: Credential,
     test_clock: TestClock,
 ) -> None:
-    """Verify failed store.release_lease on expired lease restores lease in pool tracking."""
+    """Verify a failing reclamation keeps an expired lease registered, not leaked or released."""
     store = MemoryStateStore(clock=test_clock)
     pool = CredentialPool(
         credentials=[sample_credential],
@@ -294,15 +370,15 @@ def test_expired_lease_release_failure_restores_active_lease(
     lease = pool.acquire_sync()
     test_clock.advance(10.0)
 
-    def failing_release_lease(credential_id: str) -> None:
-        raise StateStoreError("Release failed in storage backend")
+    def failing_reclaim(now: datetime) -> tuple[LeaseRecord, ...]:
+        raise StateStoreError("Reclaim failed in storage backend")
 
-    store.release_lease = failing_release_lease  # type: ignore[method-assign]
+    store.reclaim_expired_leases = failing_reclaim  # type: ignore[method-assign]
 
     with pytest.raises(StateStoreError):
         pool.report_sync(lease, Outcome.success())
 
-    # Lease must still be present in pool active leases
+    # Lease must still be registered: nothing was released and nothing leaked
     assert pool.in_flight_leases == 1
     assert lease.lease_id in [active_l.lease_id for active_l in pool.active_leases]
 
@@ -312,7 +388,7 @@ async def test_expired_lease_async_release_failure_restores_active_lease(
     sample_credential: Credential,
     test_clock: TestClock,
 ) -> None:
-    """Verify failed async release_lease on expired lease restores lease in pool tracking."""
+    """Verify a failing async reclamation keeps an expired lease registered."""
     store = MemoryStateStore(clock=test_clock)
     pool = CredentialPool(
         credentials=[sample_credential],
@@ -323,10 +399,10 @@ async def test_expired_lease_async_release_failure_restores_active_lease(
     lease = await pool.acquire()
     test_clock.advance(10.0)
 
-    async def failing_release_lease_async(credential_id: str) -> None:
-        raise StateStoreError("Async release failed in storage backend")
+    async def failing_reclaim_async(now: datetime) -> tuple[LeaseRecord, ...]:
+        raise StateStoreError("Async reclaim failed in storage backend")
 
-    store.release_lease_async = failing_release_lease_async  # type: ignore[method-assign]
+    store.reclaim_expired_leases_async = failing_reclaim_async  # type: ignore[method-assign]
 
     with pytest.raises(StateStoreError):
         await pool.report(lease, Outcome.success())
@@ -382,3 +458,29 @@ def test_memory_state_store_precedence_branches(test_clock: TestClock) -> None:
     # Second failure reaches max=2
     store.record_outcome("c5", Outcome.transient_error(retry_after=10.0), now)
     assert store.get_record("c5").state == CredentialState.UNHEALTHY  # type: ignore[union-attr]
+
+
+def test_pool_initializes_source_credentials_missing_from_minimal_store(
+    sample_credential: Credential,
+) -> None:
+    """Source credentials unknown to a store without initialize_record are registered lazily."""
+    store = DummyStore()
+    pool = CredentialPool(source=StaticSource([sample_credential]), store=store)
+
+    lease = pool.acquire_sync()
+
+    assert lease.credential_id == sample_credential.id
+    assert store.get_record(sample_credential.id) is not None
+
+
+@pytest.mark.asyncio
+async def test_pool_initializes_source_credentials_missing_from_minimal_store_async(
+    sample_credential: Credential,
+) -> None:
+    store = DummyStore()
+    pool = CredentialPool(source=StaticSource([sample_credential]), store=store)
+
+    lease = await pool.acquire()
+
+    assert lease.credential_id == sample_credential.id
+    assert store.get_record(sample_credential.id) is not None

@@ -51,7 +51,7 @@ CredWeave adheres to Clean Architecture adapted pragmatically for an idiomatic P
      - `Clock` (timekeeping & delays)
      - `CredentialSource` (credential ingestion & hot reload)
      - `SelectionStrategy` (scheduling algorithms)
-     - `StateStore` (persistence of state & cooldowns)
+     - `StateStore` (persistence of state & cooldowns, plus the lease registry that backs concurrency caps and lease reclamation)
    - Contains orchestration services like `CredentialPool`.
 3. **Infrastructure (`credweave.infrastructure`):**
    - Implements application ports with specific technologies (e.g. system clock, SQLite/Redis state stores, environment variable sources, cloud secret managers).
@@ -140,27 +140,53 @@ sequenceDiagram
     Store-->>Pool: credential runtime states
     Pool->>Strategy: select(candidates, context)
     Strategy-->>Pool: selected candidate
-    Pool->>Store: update_state(IN_FLIGHT)
+    Pool->>Store: reserve_lease(credential_id, lease_id, max_concurrency)
+    Store-->>Pool: slot claimed atomically (or refused: at capacity)
     Pool-->>App: Lease(credential, lease_id, acquired_at)
 
     Note over App: App invokes external provider<br/>using lease.credential.secrets
 
     alt Provider call succeeds
         App->>Pool: report(lease, Outcome.success())
-        Pool->>Store: update_state(AVAILABLE, record_success)
+        Pool->>Store: settle_lease(lease_id, success)
     else Provider reports 429 / Rate Limited
         App->>Pool: report(lease, Outcome.rate_limited(retry_after=30))
-        Pool->>Store: update_state(RATE_LIMITED, cooldown_until=t+30)
+        Pool->>Store: settle_lease(lease_id, rate_limited)<br/>(state -> RATE_LIMITED, cooldown_until=t+30)
     else Provider reports Auth Failed / Expired
         App->>Pool: report(lease, Outcome.auth_failed(reason="Revoked"))
-        Pool->>Store: update_state(UNHEALTHY)
+        Pool->>Store: settle_lease(lease_id, auth_failed)<br/>(state -> REVOKED)
     end
 ```
 
 **Benefits of Leases:**
-- Concurrency tracking: The pool tracks how many active leases exist for each credential (preventing exceeding account concurrency limits).
-- Leak prevention: Expired or un-reported leases can be swept or returned to the pool after timeouts.
+- Concurrency tracking: The state store tracks how many active leases exist for each credential and enforces optional per-credential caps (see 3.5.1).
+- Leak prevention: With `lease_timeout`, expired or un-reported leases are reclaimed automatically and release their concurrency slot (see 3.5.2).
 - Idempotent reporting: Each report is linked to a specific execution lease ID.
+
+#### 3.5.1 Per-Credential Concurrency Caps
+
+A cap limits how many leases of one credential may be in flight at once. `None` (the default) means unlimited.
+
+- `CredentialPool(max_concurrency_per_credential=N)` sets the pool-wide default.
+- A credential's non-secret `max_concurrency` metadata overrides it (an explicit `None` there means unlimited for that credential).
+- Zero, negative, `bool`, string and other non-integer limits raise `ConfigurationError`. Limits on the initial credentials are validated at construction; limits on credentials supplied by a dynamic source are validated when they are first considered for a lease.
+
+Enforcement is **atomic and lives in the `StateStore` port**, not in the pool: `reserve_lease()` checks the credential's in-flight count and claims the slot in a single step, so the cap holds across threads, asyncio tasks, mixed sync/async callers and any number of pools sharing one store. The pool never performs a read-check-write sequence.
+
+- A credential at its cap is *temporarily ineligible*: it is simply not offered to the strategy. Its health state, failure counter and cooldown are untouched, so round-robin, failover and the other strategies naturally route around it and return to it as soon as a slot frees up.
+- If a strategy picks a credential whose last slot is taken by a concurrent acquirer before the reservation lands, the pool refreshes its snapshot, excludes that credential for the rest of the call and selects again. If nothing is left it raises `NoCredentialsAvailableError`.
+
+#### 3.5.2 Lease Timeouts and Automatic Reclamation
+
+Every lease registered in the store carries its own deadline (`acquired_at + lease_timeout`, or none when no timeout is configured). A lease whose deadline has passed and which was never reported is *orphaned*; reclaiming it releases its concurrency slot.
+
+- **Automatic:** every `acquire` and `report` (sync and async) first reclaims expired leases. No background thread or event-loop task is involved, so there is nothing to start, stop or leak.
+- **Explicit:** `pool.reclaim_expired_leases()` / `await pool.reclaim_expired_leases_async()` do the same on demand and return the reclaimed `LeaseRecord`s, e.g. to free capacity eagerly or to log orphans.
+- Reclamation applies **no** outcome (neither success nor failure) and leaves credential health exactly as it was; it only decrements in-flight accounting.
+- It is exactly-once and idempotent: the lease is removed from the registry in the same atomic step that decrements the counter, so a lease can never be released twice and counters cannot go negative, whether the release came from a reclaim, a late report, or a race between the two.
+- A reclaimed lease can no longer be reported: `report` raises `LeaseExpiredError` and applies nothing. (The store remembers a bounded number of recently reclaimed lease ids to distinguish those from never-issued ones, which raise `InvalidLeaseError`.)
+- Because deadlines are stored with the leases and the registry is shared, a pool without `lease_timeout` still frees capacity held by expired leases of another pool on the same store.
+- Reporting is retry-safe: `settle_lease()` computes the new state before it mutates anything, so if the store raises, the lease stays registered and can be reported again without leaking or double-releasing a slot.
 
 ### 3.6 Equality and Hashing Semantics
 

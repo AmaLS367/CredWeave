@@ -4,7 +4,12 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 
 from credweave.application.ports.credential_source import CredentialSource
-from credweave.application.ports.state_store import CredentialRecord, StateStore
+from credweave.application.ports.state_store import (
+    CredentialRecord,
+    LeaseRecord,
+    LeaseSettlement,
+    StateStore,
+)
 from credweave.application.ports.strategy import (
     CredentialCandidate,
     SelectionContext,
@@ -145,6 +150,58 @@ class MockStore:
         credential_id: str,
     ) -> None:
         self.release_lease(credential_id)
+
+    def reserve_lease(
+        self,
+        credential_id: str,
+        lease_id: str,
+        timestamp: datetime,
+        *,
+        max_concurrency: int | None = None,
+        expires_at: datetime | None = None,
+    ) -> bool:
+        return True
+
+    async def reserve_lease_async(
+        self,
+        credential_id: str,
+        lease_id: str,
+        timestamp: datetime,
+        *,
+        max_concurrency: int | None = None,
+        expires_at: datetime | None = None,
+    ) -> bool:
+        return True
+
+    def settle_lease(
+        self,
+        lease_id: str,
+        credential_id: str,
+        outcome: Outcome,
+        timestamp: datetime,
+    ) -> LeaseSettlement:
+        return LeaseSettlement.UNKNOWN
+
+    async def settle_lease_async(
+        self,
+        lease_id: str,
+        credential_id: str,
+        outcome: Outcome,
+        timestamp: datetime,
+    ) -> LeaseSettlement:
+        return LeaseSettlement.UNKNOWN
+
+    def reclaim_expired_leases(self, now: datetime) -> Sequence[LeaseRecord]:
+        return ()
+
+    async def reclaim_expired_leases_async(self, now: datetime) -> Sequence[LeaseRecord]:
+        return ()
+
+    def list_active_leases(self) -> Sequence[LeaseRecord]:
+        return ()
+
+    async def list_active_leases_async(self) -> Sequence[LeaseRecord]:
+        return ()
 
 
 def test_credential_source_protocol(sample_credential: Credential) -> None:

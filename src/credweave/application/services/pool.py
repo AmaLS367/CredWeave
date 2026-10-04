@@ -1,13 +1,20 @@
 """Application service coordinating credential leasing, rotation, and lifecycle reporting."""
 
 import asyncio
+import math
 import threading
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime, timedelta
 
 from credweave.application.ports.clock import Clock
 from credweave.application.ports.credential_source import CredentialSource
-from credweave.application.ports.state_store import CredentialRecord, StateStore
+from credweave.application.ports.state_store import (
+    CredentialRecord,
+    LeaseRecord,
+    LeaseSettlement,
+    StateStore,
+)
 from credweave.application.ports.strategy import (
     CredentialCandidate,
     SelectionContext,
@@ -15,6 +22,10 @@ from credweave.application.ports.strategy import (
 )
 from credweave.application.services.lifecycle import LifecycleEngine
 from credweave.domain.backoff import BackoffPolicy, RandomSource
+from credweave.domain.concurrency import (
+    MAX_CONCURRENCY_METADATA_KEY,
+    validate_max_concurrency,
+)
 from credweave.domain.enums import CredentialState
 from credweave.domain.errors import (
     ConfigurationError,
@@ -79,12 +90,23 @@ class CredentialPool:
             ``retry_after`` replaces it.
         rng: Optional jitter randomness source returning floats in ``[0, 1)``; pass a seeded
             ``random.Random(seed).random`` for deterministic jitter.
-        lease_timeout: Optional max lifespan in seconds for a lease before LeaseExpiredError.
+        lease_timeout: Optional max lifespan in seconds (finite, greater than 0) of a lease.
+            A lease still unreported after this time is reclaimed automatically: its concurrency
+            slot is released without applying any outcome, and a later report raises
+            :class:`~credweave.domain.errors.LeaseExpiredError`.
+        max_concurrency_per_credential: Optional pool-wide cap on in-flight leases per credential
+            (an integer of at least 1; ``None`` means unlimited). A credential may override it
+            through its ``max_concurrency`` metadata (``None`` there means unlimited). Credentials
+            at their cap are temporarily skipped without any change to their health state.
 
     Note:
         ``max_consecutive_failures``, ``default_cooldown``, ``backoff`` and ``rng`` configure the
         lifecycle engine of the default state store. A custom ``store`` carries its own
         :class:`LifecycleEngine`.
+
+        Lease slots live in the state store, so concurrency caps and lease reclamation hold across
+        every pool, thread and asyncio task sharing one store. Expired leases are reclaimed
+        automatically during acquire and report; no background task is involved.
     """
 
     def __init__(
@@ -98,6 +120,7 @@ class CredentialPool:
         max_consecutive_failures: int = 3,
         default_cooldown: float = 60.0,
         lease_timeout: float | None = None,
+        max_concurrency_per_credential: int | None = None,
         backoff: BackoffPolicy | None = None,
         rng: RandomSource | None = None,
     ) -> None:
@@ -163,9 +186,14 @@ class CredentialPool:
                 "No store provided and no default store adapter is registered."
             )
 
+        self._max_concurrency_per_credential = validate_max_concurrency(
+            max_concurrency_per_credential, "max_concurrency_per_credential"
+        )
         self._lease_timeout = lease_timeout
+        self._lease_ttl = self._validate_lease_timeout(lease_timeout)
+        for cred in self._initial_credentials:
+            self._concurrency_limit(cred)
 
-        self._active_leases: dict[str, Lease] = {}
         self._pool_lock = threading.RLock()
         self._async_lock: asyncio.Lock | None = None
 
@@ -176,6 +204,27 @@ class CredentialPool:
             else:
                 if self._store.get_record(cred.id) is None:
                     self._store.update_state(cred.id, CredentialState.AVAILABLE)
+
+    def _validate_lease_timeout(self, lease_timeout: float | None) -> timedelta | None:
+        if lease_timeout is None:
+            return None
+        if (
+            isinstance(lease_timeout, bool)
+            or not isinstance(lease_timeout, (int, float))
+            or not math.isfinite(lease_timeout)
+            or lease_timeout <= 0
+        ):
+            raise ConfigurationError(
+                "lease_timeout must be None or a finite number of seconds greater than 0."
+            )
+        try:
+            ttl = timedelta(seconds=lease_timeout)
+            self._clock.now() + ttl
+        except OverflowError as exc:
+            raise ConfigurationError(
+                "lease_timeout is too large to be represented as a deadline."
+            ) from exc
+        return ttl
 
     def _get_async_lock(self) -> asyncio.Lock:
         if self._async_lock is None:
@@ -209,15 +258,26 @@ class CredentialPool:
 
     @property
     def in_flight_leases(self) -> int:
-        """Return the total count of currently active leases."""
-        with self._pool_lock:
-            return len(self._active_leases)
+        """Return the count of leases currently holding a slot in the state store.
+
+        Leases that have timed out but have not been reclaimed yet still count; they are
+        released by the next acquire, report or :meth:`reclaim_expired_leases` call.
+        """
+        return len(self._store.list_active_leases())
 
     @property
     def active_leases(self) -> tuple[Lease, ...]:
-        """Return a snapshot tuple of all currently active leases."""
-        with self._pool_lock:
-            return tuple(self._active_leases.values())
+        """Return a snapshot tuple of all leases currently holding a slot in the state store."""
+        records = self._store.list_active_leases()
+        known = {c.id: c for c in self._source.get_credentials()}
+        return tuple(
+            Lease(
+                credential=known.get(r.credential_id) or Credential(id=r.credential_id),
+                lease_id=r.lease_id,
+                acquired_at=r.acquired_at,
+            )
+            for r in records
+        )
 
     def get_credential(self, credential_id: str) -> Credential | None:
         """Retrieve a credential by its identifier from the configured source."""
@@ -226,122 +286,174 @@ class CredentialPool:
                 return c
         return None
 
-    def acquire_sync(self, context: SelectionContext | None = None) -> Lease:
-        """Acquire a credential lease synchronously according to the configured strategy."""
-        with self._pool_lock:
-            credentials = self._source.get_credentials()
-            if not credentials:
-                raise NoCredentialsAvailableError("No credentials configured in pool.")
+    def _concurrency_limit(self, credential: Credential) -> int | None:
+        """Resolve a credential's concurrency cap: its metadata override, else the pool default.
 
-            records = self._store.list_records()
-            record_map = {r.credential_id: r for r in records}
-
-            candidates: list[CredentialCandidate] = []
-            for cred in credentials:
-                rec = record_map.get(cred.id)
-                if rec is None:
-                    if hasattr(self._store, "initialize_record"):
-                        rec = self._store.initialize_record(cred.id)
-                    else:
-                        self._store.update_state(cred.id, CredentialState.AVAILABLE)
-                        rec = self._store.get_record(cred.id)
-                        if rec is None:
-                            rec = CredentialRecord(
-                                credential_id=cred.id,
-                                state=CredentialState.AVAILABLE,
-                            )
-                candidates.append(
-                    CredentialCandidate(
-                        credential=cred,
-                        state=rec.state,
-                        in_flight_leases=rec.in_flight_leases,
-                        consecutive_failures=rec.consecutive_failures,
-                        cooldown_until=rec.cooldown_until,
-                        total_leases=rec.total_leases,
-                        last_used_at=rec.last_used_at,
-                        metadata=rec.metadata,
-                    )
-                )
-
-            selected = self._strategy.select(candidates, context)
-            if selected is None:
-                raise NoCredentialsAvailableError("No eligible credentials available in pool.")
-
-            now = self._clock.now()
-            lease_id = f"lease_{uuid.uuid4().hex}"
-            lease = Lease(
-                credential=selected.credential,
-                lease_id=lease_id,
-                acquired_at=now,
+        An explicit ``max_concurrency`` of ``None`` in the metadata means unlimited.
+        """
+        if MAX_CONCURRENCY_METADATA_KEY in credential.metadata:
+            return validate_max_concurrency(
+                credential.metadata[MAX_CONCURRENCY_METADATA_KEY],
+                f"Metadata {MAX_CONCURRENCY_METADATA_KEY!r} on credential {credential.id!r}",
             )
+        return self._max_concurrency_per_credential
 
-            if hasattr(self._store, "record_acquire"):
-                self._store.record_acquire(selected.credential_id, now)
+    def _expires_at(self, acquired_at: datetime) -> datetime | None:
+        return None if self._lease_ttl is None else acquired_at + self._lease_ttl
 
-            self._active_leases[lease_id] = lease
-            return lease
+    def _build_candidates(
+        self,
+        credentials: Sequence[Credential],
+        records: Mapping[str, CredentialRecord],
+        excluded: set[str],
+    ) -> list[CredentialCandidate]:
+        """Snapshot the credentials a strategy may choose from.
+
+        Credentials at their concurrency cap, and those whose reservation was just lost to a
+        concurrent acquirer (``excluded``), are left out: they are temporarily ineligible and
+        their health state is not touched. Every credential has a record in ``records``.
+        """
+        candidates: list[CredentialCandidate] = []
+        for cred in credentials:
+            rec = records[cred.id]
+            limit = self._concurrency_limit(cred)
+            if cred.id in excluded or (limit is not None and rec.in_flight_leases >= limit):
+                continue
+            candidates.append(
+                CredentialCandidate(
+                    credential=cred,
+                    state=rec.state,
+                    in_flight_leases=rec.in_flight_leases,
+                    consecutive_failures=rec.consecutive_failures,
+                    cooldown_until=rec.cooldown_until,
+                    total_leases=rec.total_leases,
+                    last_used_at=rec.last_used_at,
+                    metadata=rec.metadata,
+                )
+            )
+        return candidates
+
+    def _new_lease(self, credential: Credential) -> Lease:
+        return Lease(
+            credential=credential,
+            lease_id=f"lease_{uuid.uuid4().hex}",
+            acquired_at=self._clock.now(),
+        )
+
+    def acquire_sync(self, context: SelectionContext | None = None) -> Lease:
+        """Acquire a credential lease synchronously according to the configured strategy.
+
+        Expired leases are reclaimed first. The chosen credential's concurrency slot is then
+        claimed atomically in the state store; if another acquirer took the last slot between
+        selection and reservation, candidates are refreshed and another eligible credential
+        is selected.
+        """
+        with self._pool_lock:
+            self._reclaim_sync()
+            excluded: set[str] = set()
+            while True:
+                credentials = self._source.get_credentials()
+                if not credentials:
+                    raise NoCredentialsAvailableError("No credentials configured in pool.")
+
+                records = {r.credential_id: r for r in self._store.list_records()}
+                for cred in credentials:
+                    if cred.id not in records:
+                        records[cred.id] = self._initialize_record_sync(cred.id)
+
+                candidates = self._build_candidates(credentials, records, excluded)
+                selected = self._strategy.select(candidates, context)
+                if selected is None:
+                    raise NoCredentialsAvailableError("No eligible credentials available in pool.")
+
+                lease = self._new_lease(selected.credential)
+                if self._store.reserve_lease(
+                    selected.credential_id,
+                    lease.lease_id,
+                    lease.acquired_at,
+                    max_concurrency=self._concurrency_limit(selected.credential),
+                    expires_at=self._expires_at(lease.acquired_at),
+                ):
+                    return lease
+                excluded.add(selected.credential_id)
 
     async def acquire(self, context: SelectionContext | None = None) -> Lease:
         """Acquire a credential lease asynchronously according to the configured strategy."""
         async with self._get_async_lock():
-            credentials = await self._source.get_credentials_async()
-            if not credentials:
-                raise NoCredentialsAvailableError("No credentials configured in pool.")
+            await self._reclaim_async()
+            excluded: set[str] = set()
+            while True:
+                credentials = await self._source.get_credentials_async()
+                if not credentials:
+                    raise NoCredentialsAvailableError("No credentials configured in pool.")
 
-            records = await self._store.list_records_async()
-            record_map = {r.credential_id: r for r in records}
+                records = {r.credential_id: r for r in await self._store.list_records_async()}
+                for cred in credentials:
+                    if cred.id not in records:
+                        records[cred.id] = await self._initialize_record_async(cred.id)
 
-            candidates: list[CredentialCandidate] = []
-            for cred in credentials:
-                rec = record_map.get(cred.id)
-                if rec is None:
-                    if hasattr(self._store, "initialize_record"):
-                        rec = self._store.initialize_record(cred.id)
-                    else:
-                        await self._store.update_state_async(cred.id, CredentialState.AVAILABLE)
-                        rec = await self._store.get_record_async(cred.id)
-                        if rec is None:
-                            rec = CredentialRecord(
-                                credential_id=cred.id,
-                                state=CredentialState.AVAILABLE,
-                            )
-                candidates.append(
-                    CredentialCandidate(
-                        credential=cred,
-                        state=rec.state,
-                        in_flight_leases=rec.in_flight_leases,
-                        consecutive_failures=rec.consecutive_failures,
-                        cooldown_until=rec.cooldown_until,
-                        total_leases=rec.total_leases,
-                        last_used_at=rec.last_used_at,
-                        metadata=rec.metadata,
-                    )
-                )
+                candidates = self._build_candidates(credentials, records, excluded)
+                with self._pool_lock:  # strategies are shared with concurrent sync acquirers
+                    selected = self._strategy.select(candidates, context)
+                if selected is None:
+                    raise NoCredentialsAvailableError("No eligible credentials available in pool.")
 
-            selected = self._strategy.select(candidates, context)
-            if selected is None:
-                raise NoCredentialsAvailableError("No eligible credentials available in pool.")
+                lease = self._new_lease(selected.credential)
+                if await self._store.reserve_lease_async(
+                    selected.credential_id,
+                    lease.lease_id,
+                    lease.acquired_at,
+                    max_concurrency=self._concurrency_limit(selected.credential),
+                    expires_at=self._expires_at(lease.acquired_at),
+                ):
+                    return lease
+                excluded.add(selected.credential_id)
 
-            now = self._clock.now()
-            lease_id = f"lease_{uuid.uuid4().hex}"
-            lease = Lease(
-                credential=selected.credential,
-                lease_id=lease_id,
-                acquired_at=now,
-            )
+    def _initialize_record_sync(self, credential_id: str) -> CredentialRecord:
+        if hasattr(self._store, "initialize_record"):
+            initialized: CredentialRecord = self._store.initialize_record(credential_id)
+            return initialized
+        self._store.update_state(credential_id, CredentialState.AVAILABLE)
+        return self._store.get_record(credential_id) or CredentialRecord(
+            credential_id=credential_id, state=CredentialState.AVAILABLE
+        )
 
-            if hasattr(self._store, "record_acquire_async"):
-                await self._store.record_acquire_async(selected.credential_id, now)
-            elif hasattr(self._store, "record_acquire"):
-                self._store.record_acquire(selected.credential_id, now)
+    async def _initialize_record_async(self, credential_id: str) -> CredentialRecord:
+        if hasattr(self._store, "initialize_record"):
+            initialized: CredentialRecord = self._store.initialize_record(credential_id)
+            return initialized
+        await self._store.update_state_async(credential_id, CredentialState.AVAILABLE)
+        return await self._store.get_record_async(credential_id) or CredentialRecord(
+            credential_id=credential_id, state=CredentialState.AVAILABLE
+        )
 
-            with self._pool_lock:
-                self._active_leases[lease_id] = lease
+    def reclaim_expired_leases(self) -> tuple[LeaseRecord, ...]:
+        """Release the concurrency slot of every lease whose deadline has passed.
 
-            return lease
+        Reclamation also happens automatically on every acquire and report, so calling this is
+        only needed to free capacity eagerly (for example from a periodic task) or to learn
+        which leases were orphaned. It applies no outcome, leaves credential health untouched,
+        releases each lease exactly once and is idempotent. Reclaimed leases can no longer be
+        reported (:class:`~credweave.domain.errors.LeaseExpiredError`).
 
-    def report_sync(self, lease: Lease, outcome: Outcome) -> None:
-        """Report execution outcome for an active lease synchronously."""
+        Returns:
+            The leases reclaimed by this call; empty when nothing had expired, in particular
+            when no ``lease_timeout`` is configured anywhere.
+        """
+        return self._reclaim_sync()
+
+    async def reclaim_expired_leases_async(self) -> tuple[LeaseRecord, ...]:
+        """Asynchronous equivalent of :meth:`reclaim_expired_leases`."""
+        return await self._reclaim_async()
+
+    def _reclaim_sync(self) -> tuple[LeaseRecord, ...]:
+        return tuple(self._store.reclaim_expired_leases(self._clock.now()))
+
+    async def _reclaim_async(self) -> tuple[LeaseRecord, ...]:
+        return tuple(await self._store.reclaim_expired_leases_async(self._clock.now()))
+
+    @staticmethod
+    def _check_report_arguments(lease: Lease, outcome: Outcome) -> None:
         if not isinstance(lease, Lease):
             raise InvalidLeaseError(
                 getattr(lease, "lease_id", "unknown"),
@@ -350,102 +462,46 @@ class CredentialPool:
         if not isinstance(outcome, Outcome):
             raise InvalidOutcomeError(f"Expected Outcome instance, got {type(outcome).__name__}.")
 
-        now = self._clock.now()
-
-        with self._pool_lock:
-            if lease.lease_id not in self._active_leases:
-                raise InvalidLeaseError(
-                    lease.lease_id,
-                    "Lease is unknown, already reported, or has expired.",
-                )
-            tracked_lease = self._active_leases[lease.lease_id]
-            if tracked_lease.credential_id != lease.credential_id:
-                raise InvalidLeaseError(
-                    lease.lease_id,
-                    f"Lease credential mismatch (expected {tracked_lease.credential_id!r}, "
-                    f"got {lease.credential_id!r}).",
-                )
-
-            is_expired = False
-            if self._lease_timeout is not None:
-                elapsed = (now - tracked_lease.acquired_at).total_seconds()
-                if elapsed > self._lease_timeout:
-                    is_expired = True
-
-            self._active_leases.pop(lease.lease_id)
-
-        if is_expired:
-            try:
-                if hasattr(self._store, "release_lease"):
-                    self._store.release_lease(lease.credential_id)
-            except Exception:
-                with self._pool_lock:
-                    self._active_leases[lease.lease_id] = tracked_lease
-                raise
+    @staticmethod
+    def _raise_for_settlement(lease: Lease, settlement: LeaseSettlement) -> None:
+        if settlement is LeaseSettlement.SETTLED:
+            return
+        if settlement is LeaseSettlement.EXPIRED:
             raise LeaseExpiredError(lease.lease_id)
+        if settlement is LeaseSettlement.MISMATCH:
+            raise InvalidLeaseError(
+                lease.lease_id,
+                f"Lease credential mismatch (credential {lease.credential_id!r} does not "
+                "own this lease).",
+            )
+        raise InvalidLeaseError(
+            lease.lease_id,
+            "Lease is unknown, already reported, or has expired.",
+        )
 
-        try:
-            self._store.record_outcome(lease.credential_id, outcome, now)
-        except Exception:
-            with self._pool_lock:
-                self._active_leases[lease.lease_id] = tracked_lease
-            raise
+    def report_sync(self, lease: Lease, outcome: Outcome) -> None:
+        """Report execution outcome for an active lease synchronously.
+
+        The lease is settled atomically in the state store: its slot is released and the
+        outcome applied exactly once. If the store fails, the lease stays active and the call
+        can be retried. A lease past its deadline, or already reclaimed, raises
+        :class:`~credweave.domain.errors.LeaseExpiredError` without applying the outcome.
+        """
+        self._check_report_arguments(lease, outcome)
+        self._reclaim_sync()
+        settlement = self._store.settle_lease(
+            lease.lease_id, lease.credential_id, outcome, self._clock.now()
+        )
+        self._raise_for_settlement(lease, settlement)
 
     async def report(self, lease: Lease, outcome: Outcome) -> None:
         """Report execution outcome for an active lease asynchronously."""
-        if not isinstance(lease, Lease):
-            raise InvalidLeaseError(
-                getattr(lease, "lease_id", "unknown"),
-                "Expected Lease instance.",
-            )
-        if not isinstance(outcome, Outcome):
-            raise InvalidOutcomeError(f"Expected Outcome instance, got {type(outcome).__name__}.")
-
-        now = self._clock.now()
-
-        with self._pool_lock:
-            if lease.lease_id not in self._active_leases:
-                raise InvalidLeaseError(
-                    lease.lease_id,
-                    "Lease is unknown, already reported, or has expired.",
-                )
-            tracked_lease = self._active_leases[lease.lease_id]
-            if tracked_lease.credential_id != lease.credential_id:
-                raise InvalidLeaseError(
-                    lease.lease_id,
-                    f"Lease credential mismatch (expected {tracked_lease.credential_id!r}, "
-                    f"got {lease.credential_id!r}).",
-                )
-
-            is_expired = False
-            if self._lease_timeout is not None:
-                elapsed = (now - tracked_lease.acquired_at).total_seconds()
-                if elapsed > self._lease_timeout:
-                    is_expired = True
-
-            self._active_leases.pop(lease.lease_id)
-
-        if is_expired:
-            try:
-                if hasattr(self._store, "release_lease_async"):
-                    await self._store.release_lease_async(lease.credential_id)
-                elif hasattr(self._store, "release_lease"):
-                    self._store.release_lease(lease.credential_id)
-            except Exception:
-                with self._pool_lock:
-                    self._active_leases[lease.lease_id] = tracked_lease
-                raise
-            raise LeaseExpiredError(lease.lease_id)
-
-        try:
-            if hasattr(self._store, "record_outcome_async"):
-                await self._store.record_outcome_async(lease.credential_id, outcome, now)
-            else:
-                self._store.record_outcome(lease.credential_id, outcome, now)
-        except Exception:
-            with self._pool_lock:
-                self._active_leases[lease.lease_id] = tracked_lease
-            raise
+        self._check_report_arguments(lease, outcome)
+        await self._reclaim_async()
+        settlement = await self._store.settle_lease_async(
+            lease.lease_id, lease.credential_id, outcome, self._clock.now()
+        )
+        self._raise_for_settlement(lease, settlement)
 
     def reset_credential(self, credential_id: str) -> None:
         """Reset credential state to AVAILABLE and clear failures and cooldowns synchronously."""

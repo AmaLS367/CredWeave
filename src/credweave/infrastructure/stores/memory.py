@@ -1,5 +1,7 @@
 """In-memory state store adapter."""
 
+import heapq
+import itertools
 import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
@@ -7,9 +9,16 @@ from datetime import datetime
 from typing import Any
 
 from credweave.application.ports.clock import Clock
-from credweave.application.ports.state_store import CredentialRecord, StateStore
+from credweave.application.ports.state_store import (
+    CredentialRecord,
+    LeaseRecord,
+    LeaseSettlement,
+    StateStore,
+)
 from credweave.application.services.lifecycle import LifecycleEngine
+from credweave.domain.concurrency import validate_max_concurrency
 from credweave.domain.enums import CredentialState
+from credweave.domain.errors import StateStoreError
 from credweave.domain.outcomes import Outcome
 from credweave.infrastructure.clocks.system import SystemClock
 
@@ -26,7 +35,16 @@ class MemoryStateStore(StateStore):
         max_consecutive_failures: Failure threshold for UNHEALTHY when no ``lifecycle`` is given.
         lifecycle: Optional lifecycle engine; overrides ``default_cooldown`` and
             ``max_consecutive_failures`` when provided.
+
+    Lease slots are tracked in a registry guarded by the same lock as the credential records,
+    so slot reservation, settlement and expiry reclamation are atomic across threads, asyncio
+    tasks and every pool sharing the store. Leases carry an optional deadline; expired leases
+    are found through a min-heap, so reclamation costs O(log n) per reclaimed lease and
+    O(1) when nothing is due.
     """
+
+    _TOMBSTONE_LIMIT = 4096
+    """How many reclaimed lease ids are remembered to tell a late report from an unknown one."""
 
     def __init__(
         self,
@@ -47,6 +65,10 @@ class MemoryStateStore(StateStore):
         )
         self._records: dict[str, CredentialRecord] = {}
         self._lock = threading.RLock()
+        self._leases: dict[str, LeaseRecord] = {}
+        self._expiry_heap: list[tuple[datetime, int, str]] = []
+        self._heap_counter = itertools.count()
+        self._reclaimed: dict[str, None] = {}
 
     def _check_cooldown_recovery(
         self,
@@ -183,6 +205,165 @@ class MemoryStateStore(StateStore):
     async def release_lease_async(self, credential_id: str) -> None:
         """Release an in-flight lease without applying an outcome asynchronously."""
         self.release_lease(credential_id)
+
+    def reserve_lease(
+        self,
+        credential_id: str,
+        lease_id: str,
+        timestamp: datetime,
+        *,
+        max_concurrency: int | None = None,
+        expires_at: datetime | None = None,
+    ) -> bool:
+        """Atomically claim a concurrency slot and register the lease synchronously."""
+        limit = validate_max_concurrency(max_concurrency, "max_concurrency")
+        with self._lock:
+            if lease_id in self._leases:
+                raise StateStoreError(f"Lease {lease_id!r} is already registered.")
+            existing = self._records.get(credential_id)
+            in_flight = existing.in_flight_leases if existing is not None else 0
+            if limit is not None and in_flight >= limit:
+                return False
+            if existing is None:
+                self._records[credential_id] = CredentialRecord(
+                    credential_id=credential_id,
+                    state=CredentialState.AVAILABLE,
+                    in_flight_leases=1,
+                    total_leases=1,
+                    last_used_at=timestamp,
+                )
+            else:
+                self._records[credential_id] = replace(
+                    existing,
+                    in_flight_leases=in_flight + 1,
+                    total_leases=existing.total_leases + 1,
+                    last_used_at=timestamp,
+                )
+            self._leases[lease_id] = LeaseRecord(
+                lease_id=lease_id,
+                credential_id=credential_id,
+                acquired_at=timestamp,
+                expires_at=expires_at,
+            )
+            if expires_at is not None:
+                heapq.heappush(self._expiry_heap, (expires_at, next(self._heap_counter), lease_id))
+                self._compact_expiry_heap()
+            return True
+
+    async def reserve_lease_async(
+        self,
+        credential_id: str,
+        lease_id: str,
+        timestamp: datetime,
+        *,
+        max_concurrency: int | None = None,
+        expires_at: datetime | None = None,
+    ) -> bool:
+        """Atomically claim a concurrency slot and register the lease asynchronously."""
+        return self.reserve_lease(
+            credential_id,
+            lease_id,
+            timestamp,
+            max_concurrency=max_concurrency,
+            expires_at=expires_at,
+        )
+
+    def settle_lease(
+        self,
+        lease_id: str,
+        credential_id: str,
+        outcome: Outcome,
+        timestamp: datetime,
+    ) -> LeaseSettlement:
+        """Atomically end a registered lease and apply its outcome synchronously."""
+        with self._lock:
+            lease = self._leases.get(lease_id)
+            if lease is None:
+                return (
+                    LeaseSettlement.EXPIRED
+                    if lease_id in self._reclaimed
+                    else LeaseSettlement.UNKNOWN
+                )
+            if lease.credential_id != credential_id:
+                return LeaseSettlement.MISMATCH
+
+            record = self._records.get(credential_id)
+            if record is None:
+                record = CredentialRecord(
+                    credential_id=credential_id,
+                    state=CredentialState.AVAILABLE,
+                )
+            expired = lease.expires_at is not None and timestamp > lease.expires_at
+            # Compute first: if the lifecycle engine raises, nothing has been mutated and the
+            # lease stays registered, so the caller can retry without leaking or double-releasing.
+            updated = (
+                self._lifecycle.reclaim(record)
+                if expired
+                else self._lifecycle.apply_outcome(record, outcome, timestamp)
+            )
+            self._records[credential_id] = updated
+            self._unregister(lease, reclaimed=expired)
+            return LeaseSettlement.EXPIRED if expired else LeaseSettlement.SETTLED
+
+    async def settle_lease_async(
+        self,
+        lease_id: str,
+        credential_id: str,
+        outcome: Outcome,
+        timestamp: datetime,
+    ) -> LeaseSettlement:
+        """Atomically end a registered lease and apply its outcome asynchronously."""
+        return self.settle_lease(lease_id, credential_id, outcome, timestamp)
+
+    def reclaim_expired_leases(self, now: datetime) -> Sequence[LeaseRecord]:
+        """Release the slot of every lease whose deadline is before ``now`` synchronously."""
+        with self._lock:
+            reclaimed: list[LeaseRecord] = []
+            heap = self._expiry_heap
+            while heap and heap[0][0] < now:
+                expires_at, _, lease_id = heapq.heappop(heap)
+                lease = self._leases.get(lease_id)
+                if lease is None or lease.expires_at != expires_at:
+                    continue  # stale index entry: the lease was already settled
+                record = self._records.get(lease.credential_id)
+                if record is not None:
+                    self._records[lease.credential_id] = self._lifecycle.reclaim(record)
+                self._unregister(lease, reclaimed=True)
+                reclaimed.append(lease)
+            return tuple(reclaimed)
+
+    async def reclaim_expired_leases_async(self, now: datetime) -> Sequence[LeaseRecord]:
+        """Release the slot of every lease whose deadline is before ``now`` asynchronously."""
+        return self.reclaim_expired_leases(now)
+
+    def list_active_leases(self) -> Sequence[LeaseRecord]:
+        """List every lease currently holding a concurrency slot synchronously."""
+        with self._lock:
+            return tuple(self._leases.values())
+
+    async def list_active_leases_async(self) -> Sequence[LeaseRecord]:
+        """List every lease currently holding a concurrency slot asynchronously."""
+        return self.list_active_leases()
+
+    def _unregister(self, lease: LeaseRecord, *, reclaimed: bool) -> None:
+        """Drop a lease from the registry, remembering it when it expired. Lock must be held."""
+        del self._leases[lease.lease_id]
+        if reclaimed:
+            self._reclaimed[lease.lease_id] = None
+            while len(self._reclaimed) > self._TOMBSTONE_LIMIT:
+                del self._reclaimed[next(iter(self._reclaimed))]
+        self._compact_expiry_heap()
+
+    def _compact_expiry_heap(self) -> None:
+        """Rebuild the expiry index when settled leases have left too many stale entries."""
+        if len(self._expiry_heap) <= 2 * len(self._leases) + 128:
+            return
+        self._expiry_heap = [
+            (lease.expires_at, next(self._heap_counter), lease.lease_id)
+            for lease in self._leases.values()
+            if lease.expires_at is not None
+        ]
+        heapq.heapify(self._expiry_heap)
 
     def record_outcome(
         self,

@@ -2,6 +2,7 @@
 
 import pytest
 
+from credweave.application.ports.state_store import LeaseSettlement
 from credweave.application.ports.strategy import SelectionContext
 from credweave.application.services.pool import CredentialPool
 from credweave.domain.enums import CredentialState
@@ -445,7 +446,7 @@ async def test_expired_lease_does_not_apply_caller_outcome_async(
 def test_report_sync_failure_safe_allows_retry(
     sample_credential: Credential, test_clock: TestClock
 ) -> None:
-    """Verify failed store.record_outcome retains lease so caller can retry safely."""
+    """Verify a failed store.settle_lease retains the lease so the caller can retry safely."""
     store = MemoryStateStore(clock=test_clock)
     pool = CredentialPool(
         credentials=[sample_credential],
@@ -456,18 +457,20 @@ def test_report_sync_failure_safe_allows_retry(
     lease = pool.acquire_sync()
     assert pool.in_flight_leases == 1
 
-    # Temporarily monkeypatch store.record_outcome to simulate transient failure
-    original_record_outcome = store.record_outcome
+    # Temporarily monkeypatch store.settle_lease to simulate transient failure
+    original_settle_lease = store.settle_lease
     attempts = 0
 
-    def flaky_record_outcome(credential_id: str, outcome: Outcome, timestamp: object) -> None:
+    def flaky_settle_lease(
+        lease_id: str, credential_id: str, outcome: Outcome, timestamp: object
+    ) -> LeaseSettlement:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise StateStoreError("Transient storage connection failure")
-        original_record_outcome(credential_id, outcome, timestamp)  # type: ignore[arg-type]
+        return original_settle_lease(lease_id, credential_id, outcome, timestamp)  # type: ignore[arg-type]
 
-    store.record_outcome = flaky_record_outcome  # type: ignore[method-assign]
+    store.settle_lease = flaky_settle_lease  # type: ignore[method-assign]
 
     # First attempt: store fails
     with pytest.raises(StateStoreError):
@@ -492,7 +495,7 @@ def test_report_sync_failure_safe_allows_retry(
 async def test_report_async_failure_safe_allows_retry(
     sample_credential: Credential, test_clock: TestClock
 ) -> None:
-    """Verify failed store.record_outcome_async retains lease in async report for safe retry."""
+    """Verify a failed store.settle_lease_async retains the lease for a safe async retry."""
     store = MemoryStateStore(clock=test_clock)
     pool = CredentialPool(
         credentials=[sample_credential],
@@ -503,19 +506,19 @@ async def test_report_async_failure_safe_allows_retry(
     lease = await pool.acquire()
     assert pool.in_flight_leases == 1
 
-    original_record_outcome_async = store.record_outcome_async
+    original_settle_lease_async = store.settle_lease_async
     attempts = 0
 
-    async def flaky_record_outcome_async(
-        credential_id: str, outcome: Outcome, timestamp: object
-    ) -> None:
+    async def flaky_settle_lease_async(
+        lease_id: str, credential_id: str, outcome: Outcome, timestamp: object
+    ) -> LeaseSettlement:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise StateStoreError("Transient storage connection failure")
-        await original_record_outcome_async(credential_id, outcome, timestamp)  # type: ignore[arg-type]
+        return await original_settle_lease_async(lease_id, credential_id, outcome, timestamp)  # type: ignore[arg-type]
 
-    store.record_outcome_async = flaky_record_outcome_async  # type: ignore[method-assign]
+    store.settle_lease_async = flaky_settle_lease_async  # type: ignore[method-assign]
 
     # First attempt fails
     with pytest.raises(StateStoreError):
