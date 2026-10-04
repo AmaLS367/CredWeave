@@ -190,6 +190,68 @@ A credential at its cap is skipped (its health is untouched) until a slot frees 
 
 ---
 
+## 🔌 Credential Sources
+
+Besides in-memory credentials (`StaticSource`), a pool can load credentials from the environment or a JSON file and **pick up rotations while running**, with no pool recreation and no background thread. Sources are re-read on every acquire; state (usage, cooldowns, health) stays attached to the stable credential `id`.
+
+### `EnvSource`: credentials from environment variables
+
+Configure **variable names**, never secret values:
+
+```python
+from credweave import CredentialPool, EnvCredential, EnvSource
+
+source = EnvSource(
+    [
+        EnvCredential(
+            id="openai-primary",
+            secrets={"api_key": "OPENAI_API_KEY_PRIMARY"},  # secret field -> env var name
+            optional_secrets={"org_id": "OPENAI_ORG_PRIMARY"},  # omitted when unset
+            metadata={"tier": "primary", "max_concurrency": 4},
+        ),
+        EnvCredential(id="openai-backup", secrets={"api_key": "OPENAI_API_KEY_BACKUP"}),
+    ]
+)
+pool = CredentialPool(source=source)
+```
+
+A required variable that is unset or empty raises `CredentialSourceError` (naming the variable, never a value). Pass `environ={...}` to read from an injected mapping instead of `os.environ`, e.g. in tests.
+
+### `JsonSource`: credentials from a JSON file
+
+```json
+{
+  "credentials": [
+    {
+      "id": "primary",
+      "secrets": {"api_key": "<your-api-key>"},
+      "metadata": {"tier": "primary", "max_concurrency": 2}
+    },
+    {"id": "backup", "secrets": {"api_key": "<your-backup-api-key>"}}
+  ]
+}
+```
+
+```python
+from credweave import CredentialPool, JsonSource
+
+source = JsonSource("credentials.json")  # raises CredentialSourceError if invalid
+pool = CredentialPool(source=source)
+
+lease = pool.acquire_sync()  # always sees the newest valid file contents
+...
+print(source.reload_status)  # generation, last_error, consecutive_failures
+```
+
+- **Strict schema:** top-level `credentials` list; each entry has a unique non-empty `id`, a non-empty `secrets` object of strings, and an optional `metadata` object. Unknown fields, duplicate keys, wrong types and `NaN` are rejected, with secret-safe messages that never echo file content.
+- **Rotation:** replace the file (ideally atomically: write a temp file, then `os.replace`). A changed secret under the same `id` is used by future leases, while the credential's history and cooldown are preserved. Added credentials are eligible immediately; removed ones receive no new leases, and their active leases can still be reported.
+- **Last known good:** if the file turns malformed, the previous credentials keep being served and `source.reload_status` / `source.refresh()` report the error. Only the initial load raises.
+- **Cost:** one `stat` per read (tune with `JsonSource(path, min_check_interval=1.0)`). The async API runs file work off the event loop.
+
+> `YamlSource` is not available yet: it needs a YAML parser, which the zero-dependency standard library does not provide.
+
+---
+
 ## 🛡️ Security & Zero-Leak Guarantees
 
 Handling API keys, bearer tokens, and secrets requires strict security invariants:
@@ -235,7 +297,9 @@ src/credweave/
 │   ├── ports/               # Clock, CredentialSource, SelectionStrategy, StateStore
 │   └── services/            # CredentialPool orchestration
 ├── infrastructure/          # Adapters implementing application ports
-│   └── clocks/              # SystemClock (real-time execution)
+│   ├── clocks/              # SystemClock (real-time execution)
+│   ├── sources/             # StaticSource, EnvSource, JsonSource, FileReloader
+│   └── stores/              # MemoryStateStore
 └── __init__.py              # Curated, strictly-typed public API exports
 ```
 

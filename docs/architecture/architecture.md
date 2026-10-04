@@ -54,7 +54,7 @@ CredWeave adheres to Clean Architecture adapted pragmatically for an idiomatic P
      - `StateStore` (persistence of state & cooldowns, plus the lease registry that backs concurrency caps and lease reclamation)
    - Contains orchestration services like `CredentialPool`.
 3. **Infrastructure (`credweave.infrastructure`):**
-   - Implements application ports with specific technologies (e.g. system clock, SQLite/Redis state stores, environment variable sources, cloud secret managers).
+   - Implements application ports with specific technologies (e.g. system clock, SQLite/Redis state stores, environment variable and JSON file sources, cloud secret managers).
    - Pluggable and optional; can be swapped without altering domain logic.
 4. **Public API (`credweave`):**
    - Re-exports clean, typed, stable public interfaces. Hides internal modules (`_internal`).
@@ -169,7 +169,7 @@ A cap limits how many leases of one credential may be in flight at once. `None` 
 
 - `CredentialPool(max_concurrency_per_credential=N)` sets the pool-wide default.
 - A credential's non-secret `max_concurrency` metadata overrides it (an explicit `None` there means unlimited for that credential).
-- Zero, negative, `bool`, string and other non-integer limits raise `ConfigurationError`. Limits on the initial credentials are validated at construction; limits on credentials supplied by a dynamic source are validated when they are first considered for a lease.
+- Zero, negative, `bool`, string and other non-integer limits raise `ConfigurationError`. Limits on the initial credentials are validated at construction; limits on credentials supplied by a dynamic source are validated when they are first considered for a lease. `EnvSource` and `JsonSource` additionally validate the `max_concurrency` metadata when they load it, so an invalid value can never reach (and break) `acquire()` through a reload.
 
 Enforcement is **atomic and lives in the `StateStore` port**, not in the pool: `reserve_lease()` checks the credential's in-flight count and claims the slot in a single step, so the cap holds across threads, asyncio tasks, mixed sync/async callers and any number of pools sharing one store. The pool never performs a read-check-write sequence.
 
@@ -242,6 +242,25 @@ pool = CredentialPool(
 
 ---
 
+### 3.9 Dynamic Credential Sources & Pull-Based Reload
+
+`CredentialPool` re-reads its `CredentialSource` on every selection round and keys all state by the **stable credential id**. A source therefore only has to return a fresh immutable snapshot; no pool reconfiguration is needed.
+
+- **`EnvSource`** is configured with environment variable *names* and rereads the environment on every call. It returns the same `Credential` objects while no value changed. A required variable that is unset or empty raises `CredentialSourceError` (an environment has no half-written intermediate state, so there is no last-known-good fallback).
+- **`JsonSource`** reads a strictly validated JSON document (schema in `credweave/infrastructure/sources/json_source.py` and the README). It delegates change detection to the reusable `FileReloader` (`infrastructure/sources/reloading.py`), which a future `YamlSource` can reuse by supplying only a parser.
+- **Pull-based, no background thread.** `FileReloader` `stat`-s the file on each read and re-reads only when its fingerprint (mtime, size, inode, device) changed; a short "racy timestamp" window falls back to comparing a content digest. Atomic `rename`/`os.replace` swaps and symlink swaps are detected. The async API runs the file work in a worker thread.
+- **Last known good.** A malformed, unreadable or schema-invalid file never replaces the served snapshot; `ReloadStatus` (`JsonSource.reload_status`) reports the secret-safe error. Only the initial load raises.
+- **Concurrency.** Refreshes are serialised by a lock and snapshots are immutable tuples swapped atomically, so readers never observe a half-loaded state and generations never go backwards.
+
+Pool semantics under reload:
+
+| Source change | Effect |
+| :--- | :--- |
+| Same id, new secrets/metadata | Future leases get the new `Credential`; the store record (usage, cooldown, failures) is kept. |
+| Id removed | No new leases. Existing leases stay reportable and `active_leases` still shows the object they were granted with. The store record is kept, so re-adding the id restores its history. |
+| New id | Eligible immediately; its store record is created lazily. |
+| Change between candidate snapshot and `reserve_lease` | The lease is linearised at snapshot time: it holds that snapshot's `Credential`, accounting is by id and unaffected. |
+
 ## 4. Architecture Diagram
 
 ```mermaid
@@ -268,7 +287,7 @@ flowchart TD
 
     subgraph InfrastructureLayer["Infrastructure Adapters (Future & Present)"]
         EnvSource["EnvSource"]
-        FileSource["Json/YamlSource (Hot Reload)"]
+        FileSource["JsonSource (Hot Reload) / YamlSource (planned)"]
         VaultSource["Cloud Secret Managers (AWS, Vault)"]
         
         MemStore["MemoryStateStore"]

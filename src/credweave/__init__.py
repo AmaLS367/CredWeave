@@ -44,6 +44,9 @@ from credweave.domain.errors import (
 from credweave.domain.models import Credential, Lease
 from credweave.domain.outcomes import Outcome
 from credweave.infrastructure.clocks.system import SystemClock
+from credweave.infrastructure.sources.env_source import EnvCredential, EnvSource
+from credweave.infrastructure.sources.json_source import JsonSource
+from credweave.infrastructure.sources.reloading import FileReloader, ReloadStatus
 from credweave.infrastructure.sources.static import StaticSource
 from credweave.infrastructure.stores.memory import MemoryStateStore
 from credweave.strategies.failover import FailoverStrategy
@@ -78,9 +81,13 @@ __all__ = [
     "CredentialSource",
     "CredentialSourceError",
     "CredentialState",
+    "EnvCredential",
+    "EnvSource",
     "FailoverStrategy",
+    "FileReloader",
     "InvalidLeaseError",
     "InvalidOutcomeError",
+    "JsonSource",
     "Lease",
     "LeaseError",
     "LeaseExpiredError",
@@ -97,6 +104,7 @@ __all__ = [
     "PoolError",
     "RandomSource",
     "RandomStrategy",
+    "ReloadStatus",
     "RetryAfterMode",
     "RoundRobinStrategy",
     "SecretAccessError",

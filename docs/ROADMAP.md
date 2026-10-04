@@ -44,9 +44,10 @@ This document outlines the planned capabilities and feature roadmap for **CredWe
 
 ## Credential Sources & Dynamic Hot Reload
 - [x] `StaticSource`: Static programmatic list of credentials.
-- [ ] `EnvSource`: Ingesting credentials and secret key-pairs from environment variables.
-- [ ] `JsonSource` & `YamlSource`: Structured file-based credential ingestion.
-- [ ] Background hot reload: automatic detection of file/env changes and zero-downtime rotation.
+- [x] `EnvSource`: Ingesting credentials and secret key-pairs from environment variables (configured with variable names, never values).
+- [ ] `JsonSource` & `YamlSource`: Structured file-based credential ingestion. `JsonSource` is implemented (stdlib only); `YamlSource` is not, because the standard library has no YAML parser.
+- [x] Pull-based hot reload for `EnvSource` and `JsonSource`: changes are detected on every `get_credentials()` (file `stat` fingerprint / environment reread), rotated credentials are served to future leases under their stable id without recreating the pool, and a bad reload keeps the last known good credentials. Reusable for future file-based sources via `FileReloader`.
+- [ ] Background (push-based) hot reload: a watcher thread/task that detects file or environment changes without waiting for the next `get_credentials()` call.
 
 ---
 

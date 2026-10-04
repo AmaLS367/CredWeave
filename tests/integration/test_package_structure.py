@@ -29,6 +29,11 @@ def test_top_level_exports() -> None:
     assert SystemClock is not None
     assert credweave.MemoryStateStore is not None
     assert credweave.StaticSource is not None
+    assert credweave.EnvSource is not None
+    assert credweave.EnvCredential is not None
+    assert credweave.JsonSource is not None
+    assert credweave.ReloadStatus is not None
+    assert credweave.FileReloader is not None
     assert credweave.RoundRobinStrategy is not None
 
 

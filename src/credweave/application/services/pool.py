@@ -4,6 +4,7 @@ import asyncio
 import math
 import threading
 import uuid
+import weakref
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta
 
@@ -196,6 +197,12 @@ class CredentialPool:
             self._concurrency_limit(cred)
 
         self._pool_lock = threading.RLock()
+        # Leases handed out by this pool, kept only while the caller still holds them. Lets
+        # ``active_leases`` report the Credential a lease was actually granted with, even after
+        # a dynamic source rotated or removed that credential.
+        self._granted_leases: weakref.WeakValueDictionary[str, Lease] = (
+            weakref.WeakValueDictionary()
+        )
         self._async_lock: asyncio.Lock | None = None
 
         # Pre-initialize store records for initial credentials
@@ -271,14 +278,18 @@ class CredentialPool:
         """Return a snapshot tuple of all leases currently holding a slot in the state store."""
         records = self._store.list_active_leases()
         known = {c.id: c for c in self._source.get_credentials()}
-        return tuple(
-            Lease(
-                credential=known.get(r.credential_id) or Credential(id=r.credential_id),
-                lease_id=r.lease_id,
-                acquired_at=r.acquired_at,
+        leases: list[Lease] = []
+        for r in records:
+            granted = self._granted_leases.get(r.lease_id)
+            credential = (
+                granted.credential
+                if granted is not None and granted.credential_id == r.credential_id
+                else known.get(r.credential_id) or Credential(id=r.credential_id)
             )
-            for r in records
-        )
+            leases.append(
+                Lease(credential=credential, lease_id=r.lease_id, acquired_at=r.acquired_at)
+            )
+        return tuple(leases)
 
     def get_credential(self, credential_id: str) -> Credential | None:
         """Retrieve a credential by its identifier from the configured source."""
@@ -345,6 +356,12 @@ class CredentialPool:
     def acquire_sync(self, context: SelectionContext | None = None) -> Lease:
         """Acquire a credential lease synchronously according to the configured strategy.
 
+        The source is re-read on every selection round, so a dynamic source's rotated, added or
+        removed credentials take effect on the next acquire. Store state is keyed by the stable
+        credential id: a lease granted from a snapshot taken just before the source changed
+        keeps that snapshot's ``Credential`` object and stays reportable, and its accounting
+        is unaffected by the change.
+
         Expired leases are reclaimed first. The chosen credential's eligibility and concurrency
         slot are then verified and claimed atomically in the state store. If another acquirer
         took the last slot, or a concurrent report changed the credential's state (revoked,
@@ -379,6 +396,7 @@ class CredentialPool:
                     expires_at=self._expires_at(lease.acquired_at),
                 )
                 if reservation is LeaseReservation.RESERVED:
+                    self._granted_leases[lease.lease_id] = lease
                     return lease
                 # AT_CAPACITY or INELIGIBLE: a lost race, not a credential fault.
                 excluded.add(selected.credential_id)
@@ -413,6 +431,7 @@ class CredentialPool:
                     expires_at=self._expires_at(lease.acquired_at),
                 )
                 if reservation is LeaseReservation.RESERVED:
+                    self._granted_leases[lease.lease_id] = lease
                     return lease
                 # AT_CAPACITY or INELIGIBLE: a lost race, not a credential fault.
                 excluded.add(selected.credential_id)
