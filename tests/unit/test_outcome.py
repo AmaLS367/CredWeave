@@ -1,5 +1,6 @@
 """Unit tests for the Outcome domain model."""
 
+import math
 from dataclasses import FrozenInstanceError
 
 import pytest
@@ -97,6 +98,79 @@ def test_outcome_validation() -> None:
 
     with pytest.raises(InvalidOutcomeError):
         Outcome(type=OutcomeType.RATE_LIMITED, retry_after=-1.0)
+
+
+@pytest.mark.parametrize(
+    "invalid_hint",
+    [
+        True,
+        False,
+        "60",
+        "invalid",
+        -1.0,
+        -0.001,
+        -100,
+        math.nan,
+        float("nan"),
+        math.inf,
+        -math.inf,
+        float("inf"),
+        float("-inf"),
+        1e300,
+        1e12,
+        1e15,
+    ],
+)
+def test_outcome_retry_after_rejects_invalid_values(invalid_hint: object) -> None:
+    """Outcome.retry_after must reject invalid and unrepresentable hints."""
+    with pytest.raises(InvalidOutcomeError):
+        Outcome(type=OutcomeType.RATE_LIMITED, retry_after=invalid_hint)  # type: ignore[arg-type]
+
+    with pytest.raises(InvalidOutcomeError):
+        Outcome.rate_limited(retry_after=invalid_hint)  # type: ignore[arg-type]
+
+    with pytest.raises(InvalidOutcomeError):
+        Outcome.quota_exhausted(retry_after=invalid_hint)  # type: ignore[arg-type]
+
+    with pytest.raises(InvalidOutcomeError):
+        Outcome.transient_error(retry_after=invalid_hint)  # type: ignore[arg-type]
+
+    with pytest.raises(InvalidOutcomeError):
+        Outcome.temporary_failure(retry_after=invalid_hint)  # type: ignore[arg-type]
+
+    with pytest.raises(InvalidOutcomeError):
+        Outcome.consecutive_failures_exceeded(retry_after=invalid_hint)  # type: ignore[arg-type]
+
+
+def test_outcome_retry_after_accepts_valid_and_very_large_representable_hints() -> None:
+    """Outcome.retry_after must accept non-negative finite real numbers and large hints."""
+    # Zero
+    o_zero = Outcome.rate_limited(retry_after=0)
+    assert o_zero.retry_after == 0.0
+    assert isinstance(o_zero.retry_after, float)
+
+    o_zero_float = Outcome.rate_limited(retry_after=0.0)
+    assert o_zero_float.retry_after == 0.0
+    assert isinstance(o_zero_float.retry_after, float)
+
+    # Integer converted to float
+    o_int = Outcome.rate_limited(retry_after=42)
+    assert o_int.retry_after == 42.0
+    assert isinstance(o_int.retry_after, float)
+
+    # Normal float
+    o_float = Outcome.rate_limited(retry_after=123.45)
+    assert o_float.retry_after == 123.45
+
+    # Very large representable hints (e.g. 200 years, 500 years)
+    hint_200_years = 200.0 * 365.0 * 24.0 * 3600.0
+    o_200 = Outcome.rate_limited(retry_after=hint_200_years)
+    assert o_200.retry_after == hint_200_years
+    assert isinstance(o_200.retry_after, float)
+
+    hint_500_years = 500.0 * 365.0 * 24.0 * 3600.0
+    o_500 = Outcome.transient_error(retry_after=hint_500_years)
+    assert o_500.retry_after == hint_500_years
 
 
 def test_outcome_immutability() -> None:

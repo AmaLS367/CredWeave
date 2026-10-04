@@ -11,6 +11,7 @@ from credweave.application.ports.state_store import CredentialRecord
 from credweave.application.services.lifecycle import STATE_PRECEDENCE, LifecycleEngine
 from credweave.domain.backoff import BackoffPolicy, RetryAfterMode
 from credweave.domain.enums import CredentialState
+from credweave.domain.errors import InvalidOutcomeError
 from credweave.domain.outcomes import Outcome
 from tests.conftest import TestClock
 
@@ -329,15 +330,39 @@ def test_unknown_outcome_type_is_treated_as_generic_failure(test_clock: TestCloc
     assert secs(now, rec) == 15.0
 
 
-def test_huge_retry_after_cannot_overflow_datetime(test_clock: TestClock) -> None:
+def test_unrepresentable_retry_after_cannot_be_created() -> None:
+    for factory in (
+        Outcome.transient_error,
+        Outcome.rate_limited,
+        Outcome.quota_exhausted,
+    ):
+        with pytest.raises(InvalidOutcomeError):
+            factory(retry_after=1e300)
+
+
+def test_very_large_representable_retry_after_is_not_clamped_to_ceiling(
+    test_clock: TestClock,
+) -> None:
     now = test_clock.now()
     engine = LifecycleEngine()
+    hint_200_years = 200.0 * 365.0 * 24.0 * 3600.0
+
     for outcome in (
-        Outcome.transient_error(retry_after=1e300),
-        Outcome.rate_limited(retry_after=1e300),
-        Outcome.quota_exhausted(retry_after=1e300),
+        Outcome.rate_limited(retry_after=hint_200_years),
+        Outcome.quota_exhausted(retry_after=hint_200_years),
+        Outcome.transient_error(retry_after=hint_200_years),
     ):
-        assert engine.apply_outcome(fresh(), outcome, now).cooldown_until is not None
+        rec = engine.apply_outcome(fresh(), outcome, now)
+        assert rec.cooldown_until == now + timedelta(seconds=hint_200_years)
+
+
+def test_retry_after_overflowing_target_datetime_fails_with_invalid_outcome_error() -> None:
+    engine = LifecycleEngine()
+    hint_2000_years = 2000.0 * 365.0 * 24.0 * 3600.0
+    now_year_9000 = datetime(9000, 1, 1)
+    outcome = Outcome.rate_limited(retry_after=hint_2000_years)
+    with pytest.raises(InvalidOutcomeError):
+        engine.apply_outcome(fresh(), outcome, now_year_9000)
 
 
 def test_threshold_and_cooldown_are_clamped_to_sane_values(test_clock: TestClock) -> None:

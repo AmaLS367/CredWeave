@@ -25,12 +25,12 @@ from datetime import datetime, timedelta
 
 from credweave.application.ports.state_store import CredentialRecord
 from credweave.domain.backoff import (
-    MAX_DELAY_CEILING,
     BackoffPolicy,
     RandomSource,
     RetryAfterMode,
 )
 from credweave.domain.enums import CredentialState, OutcomeType
+from credweave.domain.errors import InvalidOutcomeError
 from credweave.domain.outcomes import Outcome
 
 # Lower rank = higher precedence (more severe / more restrictive state).
@@ -198,7 +198,13 @@ class LifecycleEngine:
 
     @staticmethod
     def _deadline(now: datetime, delay: float) -> datetime:
-        return now + timedelta(seconds=min(delay, MAX_DELAY_CEILING))
+        try:
+            return now + timedelta(seconds=delay)
+        except (OverflowError, ValueError) as exc:
+            raise InvalidOutcomeError(
+                f"Cooldown delay {delay!r} cannot be represented safely as a datetime "
+                f"deadline from {now.isoformat()}."
+            ) from exc
 
     @staticmethod
     def _merge_cooldown(

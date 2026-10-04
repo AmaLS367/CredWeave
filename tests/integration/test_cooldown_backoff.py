@@ -148,6 +148,23 @@ def test_pool_retry_after_override_semantics(
     assert cooldown_seconds(pool, sample_credential.id, now) == 5.0
 
 
+def test_pool_retry_after_very_large_hint_is_not_clamped(
+    sample_credential: Credential, test_clock: TestClock
+) -> None:
+    pool = make_pool(
+        test_clock,
+        [sample_credential],
+        backoff=BackoffPolicy.fixed(30.0),
+    )
+    now = test_clock.now()
+    hint_200_years = 200.0 * 365.0 * 24.0 * 3600.0
+    pool.report_sync(
+        pool.acquire_sync(),
+        Outcome.rate_limited(retry_after=hint_200_years),
+    )
+    assert cooldown_seconds(pool, sample_credential.id, now) == hint_200_years
+
+
 def test_pool_rate_limits_never_make_credential_unhealthy(
     sample_credential: Credential, test_clock: TestClock
 ) -> None:

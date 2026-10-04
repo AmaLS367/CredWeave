@@ -7,6 +7,7 @@ through an injected :data:`RandomSource`, which keeps every delay deterministic 
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from enum import Enum
 
 from credweave.domain.errors import ConfigurationError
@@ -14,8 +15,9 @@ from credweave.domain.errors import ConfigurationError
 RandomSource = Callable[[], float]
 """Zero-argument callable returning a float in ``[0.0, 1.0)`` (e.g. ``random.Random(7).random``)."""
 
-# Hard ceiling (100 years) so that runaway exponents or absurd hints can never overflow
-# ``timedelta``/``datetime`` arithmetic.
+# Hard ceiling (100 years) for internally calculated exponential backoff so that runaway
+# exponents never overflow ``timedelta``/``datetime`` arithmetic. Valid upstream retry hints
+# are never capped by this ceiling.
 MAX_DELAY_CEILING = 100.0 * 365.0 * 24.0 * 3600.0
 
 
@@ -40,6 +42,30 @@ def _require_finite(value: float, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise ConfigurationError(f"{name} must be a finite number.")
     return float(value)
+
+
+def _validate_retry_after(retry_after: object) -> float:
+    """Validate that retry_after is a finite non-negative real number deadline."""
+    if isinstance(retry_after, bool):
+        raise ConfigurationError("retry_after cannot be a boolean.")
+    if not isinstance(retry_after, (int, float)):
+        raise ConfigurationError(
+            f"retry_after must be a real number, got {type(retry_after).__name__}."
+        )
+    if not math.isfinite(retry_after):
+        raise ConfigurationError("retry_after must be a finite number.")
+    if retry_after < 0:
+        raise ConfigurationError("retry_after cannot be negative.")
+    hint = float(retry_after)
+    try:
+        td = timedelta(seconds=hint)
+        datetime.min + td
+    except (OverflowError, ValueError) as exc:
+        raise ConfigurationError(
+            f"retry_after {retry_after!r} cannot be represented safely as a "
+            "datetime/timedelta deadline."
+        ) from exc
+    return hint
 
 
 @dataclass(frozen=True)
@@ -155,10 +181,14 @@ class BackoffPolicy:
         credential is never retried earlier than the provider asked. With
         :attr:`RetryAfterMode.FLOOR` the result is ``max(policy_delay, retry_after)``; with
         :attr:`RetryAfterMode.OVERRIDE` it is exactly ``retry_after``.
+
+        Raises:
+            ConfigurationError: If ``retry_after`` is not a finite non-negative real number,
+                or cannot be represented safely as a datetime/timedelta deadline.
         """
         if retry_after is None:
             return self.compute_delay(attempt, rng)
-        hint = min(float(retry_after), MAX_DELAY_CEILING)
+        hint = _validate_retry_after(retry_after)
         if self.retry_after_mode is RetryAfterMode.OVERRIDE:
             return hint
         return max(self.compute_delay(attempt, rng), hint)

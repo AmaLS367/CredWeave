@@ -139,9 +139,45 @@ def test_retry_after_override_mode_replaces_policy_delay() -> None:
     assert policy.resolve_delay(1, retry_after=None) == 60.0
 
 
-def test_absurd_retry_after_is_clamped_to_ceiling() -> None:
+def test_unrepresentable_retry_after_raises_configuration_error() -> None:
     policy = BackoffPolicy.fixed(1.0)
-    assert policy.resolve_delay(1, retry_after=1e300) == MAX_DELAY_CEILING
+    for absurd in (1e300, 1e12, 1e15):
+        with pytest.raises(ConfigurationError):
+            policy.resolve_delay(1, retry_after=absurd)
+
+
+def test_very_large_representable_retry_after_is_never_clamped_to_ceiling() -> None:
+    policy = BackoffPolicy.fixed(1.0)
+    hint_200_years = 200.0 * 365.0 * 24.0 * 3600.0
+    assert policy.resolve_delay(1, retry_after=hint_200_years) == hint_200_years
+
+    # In floor mode with calculated delay smaller than large hint
+    exp_policy = BackoffPolicy.exponential(1.0, max_delay=100.0)
+    assert exp_policy.resolve_delay(5, retry_after=hint_200_years) == hint_200_years
+
+
+@pytest.mark.parametrize(
+    "invalid_retry_after",
+    [
+        True,
+        False,
+        "30",
+        "invalid",
+        -1.0,
+        -0.001,
+        -100,
+        math.nan,
+        float("nan"),
+        math.inf,
+        -math.inf,
+        float("inf"),
+        float("-inf"),
+    ],
+)
+def test_resolve_delay_rejects_invalid_values(invalid_retry_after: object) -> None:
+    policy = BackoffPolicy.fixed(1.0)
+    with pytest.raises(ConfigurationError):
+        policy.resolve_delay(1, retry_after=invalid_retry_after)  # type: ignore[arg-type]
 
 
 def test_no_retry_after_uses_policy_delay() -> None:

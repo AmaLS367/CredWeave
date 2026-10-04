@@ -1,12 +1,38 @@
 """Domain model representing the reported outcome of a credential lease execution."""
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from types import MappingProxyType
 from typing import Any
 
 from credweave.domain.enums import OutcomeType
 from credweave.domain.errors import InvalidOutcomeError
+
+
+def _validate_retry_after(retry_after: object) -> float:
+    """Validate that retry_after is a finite non-negative real number deadline."""
+    if isinstance(retry_after, bool):
+        raise InvalidOutcomeError("retry_after cannot be a boolean.")
+    if not isinstance(retry_after, (int, float)):
+        raise InvalidOutcomeError(
+            f"retry_after must be a real number, got {type(retry_after).__name__}."
+        )
+    if not math.isfinite(retry_after):
+        raise InvalidOutcomeError("retry_after must be a finite number.")
+    if retry_after < 0:
+        raise InvalidOutcomeError("retry_after cannot be negative.")
+    hint = float(retry_after)
+    try:
+        td = timedelta(seconds=hint)
+        datetime.min + td
+    except (OverflowError, ValueError) as exc:
+        raise InvalidOutcomeError(
+            f"retry_after {retry_after!r} cannot be represented safely as a "
+            "datetime/timedelta deadline."
+        ) from exc
+    return hint
 
 
 @dataclass(frozen=True)
@@ -19,6 +45,8 @@ class Outcome:
     Attributes:
         type: The category of outcome (success, rate limited, auth failure, etc.).
         retry_after: Optional recommended duration in seconds before reusing the credential.
+            When provided, must be a finite non-negative real number representable safely as a
+            datetime/timedelta deadline.
         reason: Optional human-readable diagnosis or failure reason (must NOT contain secrets).
         metadata: Optional non-secret diagnostic metadata (e.g. status code, attempt count).
     """
@@ -41,8 +69,8 @@ class Outcome:
                     f"Outcome type must be an OutcomeType, got {type(raw_type).__name__}."
                 )
 
-        if self.retry_after is not None and self.retry_after < 0:
-            raise InvalidOutcomeError("retry_after cannot be negative.")
+        if self.retry_after is not None:
+            object.__setattr__(self, "retry_after", _validate_retry_after(self.retry_after))
 
         if not isinstance(self.metadata, MappingProxyType):
             object.__setattr__(
