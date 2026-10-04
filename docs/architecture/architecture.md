@@ -186,6 +186,34 @@ CredWeave uses **Hatchling** (`hatchling.build`) as its PEP 517/621 build backen
 - **Typing compliance:** Flawlessly bundles `py.typed` without legacy `MANIFEST.in` requirements.
 - **Fast, modern, reproducible:** Avoids legacy setuptools build hooks and deprecation warnings.
 
+### 3.8 Lifecycle Engine: Cooldown, Health & Backoff Rules
+
+All credential-state business rules live in `LifecycleEngine` (`credweave.application.services.lifecycle`) and the pure `BackoffPolicy` value object (`credweave.domain.backoff`). The engine is a side-effect-free function from `(CredentialRecord, Outcome, now)` to a new `CredentialRecord`: no I/O, no locking, no clock reads, no networking. A `StateStore` only loads a record, calls the engine and persists the result atomically, so SQLite/Redis stores reuse the exact same rules as `MemoryStateStore`.
+
+| Outcome | Result | Counts as health failure |
+|---|---|---|
+| `SUCCESS` | Resets failure progression; never overrides a stronger state set by another in-flight lease | no |
+| `RATE_LIMITED` | `RATE_LIMITED` until `retry_after` (or the policy base delay if absent) | no |
+| `QUOTA_EXHAUSTED` | `QUOTA_EXHAUSTED` until `retry_after`, indefinite if absent | no |
+| `TRANSIENT_ERROR` | `COOLDOWN` for the backoff delay; `UNHEALTHY` once `max_consecutive_failures` is reached | yes |
+| `PERMANENT_FAILURE` | `UNHEALTHY` | yes |
+| `AUTH_FAILED` | `REVOKED` | yes |
+
+**Backoff:** `delay(n) = min(max_delay, base_delay * multiplier ** (n - 1))` for the n-th consecutive failure (`multiplier=1` is a fixed cooldown). Optional proportional `jitter` in `[0, 1]` removes a random share of the capped delay, so `max_delay` stays a hard ceiling. Randomness is an injectable `RandomSource` (e.g. `random.Random(seed).random`) for deterministic tests.
+
+**`retry_after`:** the upstream hint is never shortened or capped. With `RetryAfterMode.FLOOR` (default for explicit policies) a failure cools down for `max(policy_delay, retry_after)`; with `RetryAfterMode.OVERRIDE` the hint replaces the policy delay. Pools created without an explicit `backoff` use a fixed `default_cooldown` in `OVERRIDE` mode, which preserves the pre-engine behavior. Rate limits and quota exhaustion are throttling, not health signals, so for them the hint is exact and the failure progression is neither consulted nor advanced.
+
+**Recovery and probes:** when a timed cooldown elapses the credential returns to `AVAILABLE` with its failure count intact. That window is the half-open "probe" state: the credential is merely eligible again, a further failure escalates the backoff, and a `SUCCESS` resets it. Whether and how to probe a provider stays entirely with the caller; CredWeave performs no network requests.
+
+```python
+pool = CredentialPool(
+    credentials,
+    backoff=BackoffPolicy.exponential(1.0, multiplier=2.0, max_delay=60.0, jitter=0.2),
+    max_consecutive_failures=5,
+    rng=random.Random(42).random,  # optional: deterministic jitter
+)
+```
+
 ---
 
 ## 4. Architecture Diagram

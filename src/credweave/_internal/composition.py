@@ -17,9 +17,8 @@ def configure_default_adapters() -> None:
         clock_factory=SystemClock,
         strategy_factory=RoundRobinStrategy,
         source_factory=lambda creds: StaticSource(creds),
-        store_factory=lambda clock, cooldown, max_failures: MemoryStateStore(
+        store_factory=lambda clock, lifecycle: MemoryStateStore(
             clock=clock,
-            default_cooldown=cooldown,
-            max_consecutive_failures=max_failures,
+            lifecycle=lifecycle,
         ),
     )

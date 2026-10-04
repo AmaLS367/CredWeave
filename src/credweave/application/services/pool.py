@@ -13,6 +13,8 @@ from credweave.application.ports.strategy import (
     SelectionContext,
     SelectionStrategy,
 )
+from credweave.application.services.lifecycle import LifecycleEngine
+from credweave.domain.backoff import BackoffPolicy, RandomSource
 from credweave.domain.enums import CredentialState
 from credweave.domain.errors import (
     ConfigurationError,
@@ -28,7 +30,7 @@ from credweave.domain.outcomes import Outcome
 ClockFactory = Callable[[], Clock]
 StrategyFactory = Callable[[], SelectionStrategy]
 SourceFactory = Callable[[Sequence[Credential]], CredentialSource]
-StoreFactory = Callable[[Clock, float, int], StateStore]
+StoreFactory = Callable[[Clock, LifecycleEngine], StateStore]
 
 _default_clock_factory: ClockFactory | None = None
 _default_strategy_factory: StrategyFactory | None = None
@@ -70,8 +72,19 @@ class CredentialPool:
         store: Optional state persistence adapter (e.g. in-memory, SQLite, Redis).
         clock: Optional clock instance for deterministic time and cooldown evaluation.
         max_consecutive_failures: Number of consecutive failures before marking UNHEALTHY.
-        default_cooldown: Default cooldown seconds when not specified by outcome.
+        default_cooldown: Fixed cooldown seconds when the outcome carries no ``retry_after``.
+            Ignored when ``backoff`` is given.
+        backoff: Optional backoff policy (fixed or exponential, with optional jitter) deciding
+            cooldown delays. When omitted, a fixed ``default_cooldown`` is used and an upstream
+            ``retry_after`` replaces it.
+        rng: Optional jitter randomness source returning floats in ``[0, 1)``; pass a seeded
+            ``random.Random(seed).random`` for deterministic jitter.
         lease_timeout: Optional max lifespan in seconds for a lease before LeaseExpiredError.
+
+    Note:
+        ``max_consecutive_failures``, ``default_cooldown``, ``backoff`` and ``rng`` configure the
+        lifecycle engine of the default state store. A custom ``store`` carries its own
+        :class:`LifecycleEngine`.
     """
 
     def __init__(
@@ -85,6 +98,8 @@ class CredentialPool:
         max_consecutive_failures: int = 3,
         default_cooldown: float = 60.0,
         lease_timeout: float | None = None,
+        backoff: BackoffPolicy | None = None,
+        rng: RandomSource | None = None,
     ) -> None:
         if credentials is None and source is None:
             raise ConfigurationError(
@@ -136,8 +151,12 @@ class CredentialPool:
         elif _default_store_factory is not None:
             self._store = _default_store_factory(
                 self._clock,
-                default_cooldown,
-                max_consecutive_failures,
+                LifecycleEngine(
+                    backoff=backoff,
+                    max_consecutive_failures=max_consecutive_failures,
+                    default_cooldown=default_cooldown,
+                    rng=rng,
+                ),
             )
         else:
             raise ConfigurationError(

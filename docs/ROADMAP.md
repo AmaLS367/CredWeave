@@ -26,24 +26,24 @@ This document outlines the planned capabilities and feature roadmap for **CredWe
 ---
 
 ## Cooldown, Health & Backoff Engine
-- [ ] Automatic state transitions (`AVAILABLE` -> `RATE_LIMITED` / `COOLDOWN` / `UNHEALTHY`).
-- [ ] Fixed cooldown durations and exponential backoff with jitter.
-- [ ] Respecting upstream `retry_after` hints from provider responses.
-- [ ] Consecutive failure thresholds and automatic isolation of broken keys.
-- [ ] Automatic recovery and probe requests when cooldown expires.
+- [x] Automatic state transitions (`AVAILABLE` -> `RATE_LIMITED` / `COOLDOWN` / `UNHEALTHY`).
+- [x] Fixed cooldown durations and exponential backoff with jitter.
+- [x] Respecting upstream `retry_after` hints from provider responses.
+- [x] Consecutive failure thresholds and automatic isolation of broken keys.
+- [x] Automatic recovery when cooldown expires; probe eligibility is modeled as lifecycle state only (CredWeave never issues probe requests).
 
 ---
 
 ## Concurrency & Lease Management
-- [ ] Thread-safe and `asyncio`-safe in-memory state tracking (`MemoryStateStore`).
-- [ ] Dual synchronous (`pool.acquire_sync()`, `pool.report_sync()`) and asynchronous (`await pool.acquire()`, `await pool.report()`) ergonomics.
+- [x] Thread-safe and `asyncio`-safe in-memory state tracking (`MemoryStateStore`).
+- [x] Dual synchronous (`pool.acquire_sync()`, `pool.report_sync()`) and asynchronous (`await pool.acquire()`, `await pool.report()`) ergonomics.
 - [ ] Per-credential concurrency caps (limiting in-flight parallel leases).
 - [ ] Lease timeout tracking and automatic reclamation of orphaned leases.
 
 ---
 
 ## Credential Sources & Dynamic Hot Reload
-- [ ] `StaticSource`: Static programmatic list of credentials.
+- [x] `StaticSource`: Static programmatic list of credentials.
 - [ ] `EnvSource`: Ingesting credentials and secret key-pairs from environment variables.
 - [ ] `JsonSource` & `YamlSource`: Structured file-based credential ingestion.
 - [ ] Background hot reload: automatic detection of file/env changes and zero-downtime rotation.

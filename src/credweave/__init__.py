@@ -15,7 +15,9 @@ from credweave.application.ports.strategy import (
     SelectionContext,
     SelectionStrategy,
 )
+from credweave.application.services.lifecycle import LifecycleEngine
 from credweave.application.services.pool import CredentialPool
+from credweave.domain.backoff import BackoffPolicy, RandomSource, RetryAfterMode
 from credweave.domain.enums import CredentialState, OutcomeType
 from credweave.domain.errors import (
     ConfigurationError,
@@ -56,6 +58,7 @@ except PackageNotFoundError:
     __version__ = "0.1.0"
 
 __all__ = [
+    "BackoffPolicy",
     "Clock",
     "ConfigurationError",
     "CredWeaveError",
@@ -77,12 +80,15 @@ __all__ = [
     "LeaseExpiredError",
     "LeastRecentlyUsedStrategy",
     "LeastUsedStrategy",
+    "LifecycleEngine",
     "MemoryStateStore",
     "NoCredentialsAvailableError",
     "Outcome",
     "OutcomeType",
     "PoolError",
+    "RandomSource",
     "RandomStrategy",
+    "RetryAfterMode",
     "RoundRobinStrategy",
     "SecretAccessError",
     "SelectionContext",

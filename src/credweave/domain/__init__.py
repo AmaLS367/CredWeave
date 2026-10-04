@@ -1,5 +1,6 @@
 """Domain layer models, errors, and enumerations for CredWeave."""
 
+from credweave.domain.backoff import BackoffPolicy, RandomSource, RetryAfterMode
 from credweave.domain.enums import CredentialState, OutcomeType
 from credweave.domain.errors import (
     ConfigurationError,
@@ -21,6 +22,7 @@ from credweave.domain.models import Credential, Lease
 from credweave.domain.outcomes import Outcome
 
 __all__ = [
+    "BackoffPolicy",
     "ConfigurationError",
     "CredWeaveError",
     "Credential",
@@ -38,6 +40,8 @@ __all__ = [
     "Outcome",
     "OutcomeType",
     "PoolError",
+    "RandomSource",
+    "RetryAfterMode",
     "SecretAccessError",
     "StateStoreError",
 ]

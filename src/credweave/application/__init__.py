@@ -8,6 +8,7 @@ from credweave.application.ports.strategy import (
     SelectionContext,
     SelectionStrategy,
 )
+from credweave.application.services.lifecycle import LifecycleEngine
 from credweave.application.services.pool import CredentialPool
 
 __all__ = [
@@ -16,6 +17,7 @@ __all__ = [
     "CredentialPool",
     "CredentialRecord",
     "CredentialSource",
+    "LifecycleEngine",
     "SelectionContext",
     "SelectionStrategy",
     "StateStore",
