@@ -4,9 +4,9 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from types import MappingProxyType
 from typing import Any, Protocol, runtime_checkable
 
+from credweave.domain._security import SecretSafeMapping, mask_metadata
 from credweave.domain.enums import CredentialState
 from credweave.domain.outcomes import Outcome
 
@@ -25,12 +25,31 @@ class CredentialRecord:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not isinstance(self.metadata, MappingProxyType):
+        if not isinstance(self.metadata, SecretSafeMapping):
             object.__setattr__(
                 self,
                 "metadata",
-                MappingProxyType(dict(self.metadata)),
+                SecretSafeMapping(self.metadata),
             )
+
+    def __repr__(self) -> str:
+        """Return secret-safe string representation."""
+        masked_meta = mask_metadata(self.metadata)
+        return (
+            f"{self.__class__.__name__}("
+            f"credential_id={self.credential_id!r}, "
+            f"state={self.state!r}, "
+            f"in_flight_leases={self.in_flight_leases!r}, "
+            f"consecutive_failures={self.consecutive_failures!r}, "
+            f"cooldown_until={self.cooldown_until!r}, "
+            f"last_used_at={self.last_used_at!r}, "
+            f"total_leases={self.total_leases!r}, "
+            f"metadata={masked_meta!r}"
+            f")"
+        )
+
+    def __str__(self) -> str:
+        return self.__repr__()
 
 
 @dataclass(frozen=True)

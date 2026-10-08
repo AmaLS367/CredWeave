@@ -42,6 +42,7 @@ from datetime import datetime
 from typing import Generic, TypeVar
 
 from credweave.application.ports.clock import Clock
+from credweave.domain._security import mask_secret_text
 from credweave.domain.errors import ConfigurationError, CredentialSourceError
 from credweave.infrastructure.clocks.system import SystemClock
 
@@ -83,6 +84,22 @@ class ReloadStatus:
     def ok(self) -> bool:
         """True when the latest reload attempt succeeded (no pending error)."""
         return self.last_error is None
+
+    def __repr__(self) -> str:
+        """Return secret-safe string representation."""
+        masked_error = mask_secret_text(self.last_error) if self.last_error is not None else None
+        return (
+            f"{self.__class__.__name__}("
+            f"generation={self.generation!r}, "
+            f"loaded_at={self.loaded_at!r}, "
+            f"last_error={masked_error!r}, "
+            f"last_error_at={self.last_error_at!r}, "
+            f"consecutive_failures={self.consecutive_failures!r}"
+            f")"
+        )
+
+    def __str__(self) -> str:
+        return self.__repr__()
 
 
 @dataclass(frozen=True)
@@ -317,7 +334,8 @@ class FileReloader(Generic[T]):
         _logger.info("credweave: %s %r is valid again", self._name, self._path)
 
     def _record_failure(self, message: str) -> None:
-        full = f"{self._name} {self._path!r}: {message}"
+        sanitized_msg = mask_secret_text(message) or message
+        full = f"{self._name} {self._path!r}: {sanitized_msg}"
         previous = self._status
         self._status = ReloadStatus(
             generation=previous.generation,
@@ -330,5 +348,5 @@ class FileReloader(Generic[T]):
             _logger.warning(
                 "credweave: reload of %s failed, keeping the last known good credentials: %s",
                 self._name,
-                message,
+                sanitized_msg,
             )

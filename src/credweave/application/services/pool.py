@@ -515,18 +515,24 @@ class CredentialPool:
         :class:`~credweave.domain.errors.LeaseExpiredError` without applying the outcome.
         """
         self._check_report_arguments(lease, outcome)
+        raw_secrets = getattr(lease.credential, "_raw_secrets", {})
+        secret_values = raw_secrets.values() if hasattr(raw_secrets, "values") else ()
+        safe_outcome = outcome.redact(secret_values)
         self._reclaim_sync()
         settlement = self._store.settle_lease(
-            lease.lease_id, lease.credential_id, outcome, self._clock.now()
+            lease.lease_id, lease.credential_id, safe_outcome, self._clock.now()
         )
         self._raise_for_settlement(lease, settlement)
 
     async def report(self, lease: Lease, outcome: Outcome) -> None:
         """Report execution outcome for an active lease asynchronously."""
         self._check_report_arguments(lease, outcome)
+        raw_secrets = getattr(lease.credential, "_raw_secrets", {})
+        secret_values = raw_secrets.values() if hasattr(raw_secrets, "values") else ()
+        safe_outcome = outcome.redact(secret_values)
         await self._reclaim_async()
         settlement = await self._store.settle_lease_async(
-            lease.lease_id, lease.credential_id, outcome, self._clock.now()
+            lease.lease_id, lease.credential_id, safe_outcome, self._clock.now()
         )
         self._raise_for_settlement(lease, settlement)
 

@@ -12,6 +12,7 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import Any
 
+from credweave.domain._security import SecretSafeMapping, mask_metadata
 from credweave.domain.errors import ConfigurationError, SecretAccessError
 
 
@@ -52,7 +53,9 @@ class Credential:
         raw_secrets = dict(secrets or {})
         self._raw_secrets: Mapping[str, Any] = MappingProxyType(raw_secrets)
         self._secrets: Mapping[str, str] = MappingProxyType(dict.fromkeys(raw_secrets, "***"))
-        self._metadata: Mapping[str, Any] = MappingProxyType(dict(metadata or {}))
+        self._metadata: Mapping[str, Any] = SecretSafeMapping(
+            metadata or {}, raw_secrets=raw_secrets.values()
+        )
 
     @property
     def id(self) -> str:
@@ -103,11 +106,12 @@ class Credential:
 
     def __repr__(self) -> str:
         """Return secret-safe string representation with masked secret values."""
+        masked_meta = mask_metadata(self._metadata, raw_secrets=self._raw_secrets.values())
         return (
             f"{self.__class__.__name__}("
             f"id={self._id!r}, "
             f"secrets={dict(self._secrets)!r}, "
-            f"metadata={dict(self._metadata)!r}"
+            f"metadata={masked_meta!r}"
             f")"
         )
 
@@ -145,14 +149,34 @@ class Lease:
             raise ConfigurationError("Lease credential must be an instance of Credential.")
         if not isinstance(self.lease_id, str) or not self.lease_id.strip():
             raise ConfigurationError("Lease lease_id must be a non-empty string.")
-        if not isinstance(self.metadata, MappingProxyType):
+        raw_secrets = getattr(self.credential, "_raw_secrets", {})
+        secret_values = raw_secrets.values() if hasattr(raw_secrets, "values") else ()
+        if not isinstance(self.metadata, SecretSafeMapping):
             object.__setattr__(
                 self,
                 "metadata",
-                MappingProxyType(dict(self.metadata)),
+                SecretSafeMapping(self.metadata, raw_secrets=secret_values),
             )
 
     @property
     def credential_id(self) -> str:
         """Convenience property to access the underlying credential's identifier."""
         return self.credential.id
+
+    def __repr__(self) -> str:
+        """Return secret-safe string representation with masked secret values."""
+        raw_secrets = getattr(self.credential, "_raw_secrets", {})
+        secret_values = raw_secrets.values() if hasattr(raw_secrets, "values") else ()
+        masked_meta = mask_metadata(self.metadata, raw_secrets=secret_values)
+        return (
+            f"{self.__class__.__name__}("
+            f"credential={self.credential!r}, "
+            f"lease_id={self.lease_id!r}, "
+            f"acquired_at={self.acquired_at!r}, "
+            f"metadata={masked_meta!r}"
+            f")"
+        )
+
+    def __str__(self) -> str:
+        """Return secret-safe string representation with masked secret values."""
+        return self.__repr__()

@@ -5,11 +5,25 @@ Security Guarantee:
     Errors should reference identifiers, parameter names, or sanitized descriptors.
 """
 
+from collections.abc import Mapping
 from typing import Any
+
+from credweave.domain._security import SecretSafeMapping, mask_metadata, mask_secret_text
 
 
 class CredWeaveError(Exception):
     """Base class for all CredWeave domain and runtime exceptions."""
+
+    def __init__(self, *args: object) -> None:
+        sanitized = tuple(mask_secret_text(str(a)) if isinstance(a, str) else a for a in args)
+        super().__init__(*sanitized)
+
+    def __str__(self) -> str:
+        return mask_secret_text(super().__str__()) or ""
+
+    def __repr__(self) -> str:
+        arg_strs = [mask_secret_text(repr(a)) or "" for a in self.args]
+        return f"{self.__class__.__name__}({', '.join(arg_strs)})"
 
 
 class ConfigurationError(CredWeaveError):
@@ -41,8 +55,9 @@ class SecretAccessError(CredentialError):
 
     def __init__(self, credential_id: str, key: str) -> None:
         self.credential_id = credential_id
-        self.key = key
-        super().__init__(f"Secret key {key!r} not found on credential {credential_id!r}.")
+        sanitized_key = mask_secret_text(key) or key
+        self.key = sanitized_key
+        super().__init__(f"Secret key {sanitized_key!r} not found on credential {credential_id!r}.")
 
 
 class PoolError(CredWeaveError):
@@ -73,18 +88,37 @@ class InvalidLeaseError(LeaseError):
 
     def __init__(self, lease_id: str, reason: str | None = None) -> None:
         self.lease_id = lease_id
+        sanitized_reason = mask_secret_text(reason) if reason else None
+        self.reason = sanitized_reason
         msg = f"Invalid lease {lease_id!r}"
-        if reason:
-            msg += f": {reason}"
+        if sanitized_reason:
+            msg += f": {sanitized_reason}"
         super().__init__(msg)
 
 
 class InvalidOutcomeError(CredWeaveError):
     """Raised when an invalid outcome is reported."""
 
+    details: Any
+
     def __init__(self, message: str, details: Any = None) -> None:
-        self.details = details
+        if isinstance(details, Mapping):
+            self.details = SecretSafeMapping(details)
+        elif isinstance(details, str):
+            self.details = mask_secret_text(details)
+        else:
+            self.details = details
         super().__init__(message)
+
+    def __repr__(self) -> str:
+        if self.details is None:
+            return f"{self.__class__.__name__}({str(self)!r})"
+        masked = (
+            mask_metadata(self.details)
+            if isinstance(self.details, Mapping)
+            else mask_secret_text(str(self.details))
+        )
+        return f"{self.__class__.__name__}({str(self)!r}, details={masked!r})"
 
 
 class StateStoreError(CredWeaveError):

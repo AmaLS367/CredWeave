@@ -1,12 +1,12 @@
 """Domain model representing the reported outcome of a credential lease execution."""
 
 import math
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from types import MappingProxyType
 from typing import Any
 
+from credweave.domain._security import SecretSafeMapping, mask_metadata, mask_secret_text
 from credweave.domain.enums import OutcomeType
 from credweave.domain.errors import InvalidOutcomeError
 
@@ -27,11 +27,11 @@ def _validate_retry_after(retry_after: object) -> float:
     try:
         td = timedelta(seconds=hint)
         datetime.min + td
-    except (OverflowError, ValueError) as exc:
+    except (OverflowError, ValueError):
         raise InvalidOutcomeError(
             f"retry_after {retry_after!r} cannot be represented safely as a "
             "datetime/timedelta deadline."
-        ) from exc
+        ) from None
     return hint
 
 
@@ -62,22 +62,56 @@ class Outcome:
             if isinstance(raw_type, str):
                 try:
                     object.__setattr__(self, "type", OutcomeType(raw_type))
-                except ValueError as exc:
-                    raise InvalidOutcomeError(f"Invalid outcome type: {raw_type!r}") from exc
+                except ValueError:
+                    sanitized_type = mask_secret_text(raw_type)
+                    raise InvalidOutcomeError(f"Invalid outcome type: {sanitized_type!r}") from None
             else:
                 raise InvalidOutcomeError(
                     f"Outcome type must be an OutcomeType, got {type(raw_type).__name__}."
-                )
+                ) from None
 
         if self.retry_after is not None:
             object.__setattr__(self, "retry_after", _validate_retry_after(self.retry_after))
 
-        if not isinstance(self.metadata, MappingProxyType):
+        if not isinstance(self.metadata, SecretSafeMapping):
             object.__setattr__(
                 self,
                 "metadata",
-                MappingProxyType(dict(self.metadata)),
+                SecretSafeMapping(self.metadata),
             )
+
+    def redact(self, secrets: Iterable[str] = ()) -> "Outcome":
+        """Return a copy of this Outcome with all occurrences of secrets redacted."""
+        secrets_tuple = tuple(s for s in secrets if isinstance(s, str) and s)
+        new_reason = (
+            mask_secret_text(self.reason, raw_secrets=secrets_tuple)
+            if self.reason is not None
+            else None
+        )
+        new_meta = mask_metadata(self.metadata, raw_secrets=secrets_tuple)
+        return Outcome(
+            type=self.type,
+            retry_after=self.retry_after,
+            reason=new_reason,
+            metadata=new_meta,
+        )
+
+    def __repr__(self) -> str:
+        """Return secret-safe string representation with masked secret values."""
+        masked_reason = mask_secret_text(self.reason) if self.reason is not None else None
+        masked_meta = mask_metadata(self.metadata)
+        return (
+            f"{self.__class__.__name__}("
+            f"type={self.type!r}, "
+            f"retry_after={self.retry_after!r}, "
+            f"reason={masked_reason!r}, "
+            f"metadata={masked_meta!r}"
+            f")"
+        )
+
+    def __str__(self) -> str:
+        """Return secret-safe string representation with masked secret values."""
+        return self.__repr__()
 
     @property
     def is_success(self) -> bool:
