@@ -104,6 +104,7 @@ class MockStore:
         *,
         max_concurrency: int | None = None,
         expires_at: datetime | None = None,
+        secret_fingerprint: str | None = None,
     ) -> LeaseReservation:
         return LeaseReservation.RESERVED
 
@@ -115,6 +116,7 @@ class MockStore:
         *,
         max_concurrency: int | None = None,
         expires_at: datetime | None = None,
+        secret_fingerprint: str | None = None,
     ) -> LeaseReservation:
         return LeaseReservation.RESERVED
 

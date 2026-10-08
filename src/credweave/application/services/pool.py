@@ -32,6 +32,7 @@ from credweave.domain.enums import CredentialState
 from credweave.domain.errors import (
     ConfigurationError,
     CredentialAlreadyExistsError,
+    CredentialSourceError,
     InvalidLeaseError,
     InvalidOutcomeError,
     LeaseExpiredError,
@@ -213,6 +214,25 @@ class CredentialPool:
                 if self._store.get_record(cred.id) is None:
                     self._store.update_state(cred.id, CredentialState.AVAILABLE)
 
+        self._observe_starting_secrets()
+
+    def _observe_starting_secrets(self) -> None:
+        """Make the store aware of the secrets this pool starts with.
+
+        The store cannot order two secrets it has never seen, so a snapshot read long before
+        another pool rotated would be adopted as the newer secret. Observing the starting secrets
+        at construction lets the store recognise such a snapshot as superseded. A source that
+        cannot be read yet is skipped: the next acquire reads it again and reports the error.
+        """
+        if not hasattr(self._store, "sync_credential"):
+            return
+        try:
+            credentials = self._source.get_credentials()
+        except CredentialSourceError:
+            return
+        for cred in credentials:
+            self._store.sync_credential(cred.id, secret_fingerprint=cred.secret_fingerprint)
+
     def _validate_lease_timeout(self, lease_timeout: float | None) -> timedelta | None:
         if lease_timeout is None:
             return None
@@ -364,8 +384,9 @@ class CredentialPool:
 
         Expired leases are reclaimed first. The chosen credential's eligibility and concurrency
         slot are then verified and claimed atomically in the state store. If another acquirer
-        took the last slot, or a concurrent report changed the credential's state (revoked,
-        rate limited, cooling down...) between selection and reservation, that credential is
+        took the last slot, a concurrent report changed the credential's state (revoked,
+        rate limited, cooling down...), or a rotation superseded the selected snapshot, between
+        selection and reservation, that credential is
         skipped for this call, candidates are refreshed and another one is selected. Losing
         such a race never changes a credential's health state.
         """
@@ -399,11 +420,12 @@ class CredentialPool:
                     lease.acquired_at,
                     max_concurrency=self._concurrency_limit(selected.credential),
                     expires_at=self._expires_at(lease.acquired_at),
+                    secret_fingerprint=getattr(selected.credential, "secret_fingerprint", None),
                 )
                 if reservation is LeaseReservation.RESERVED:
                     self._granted_leases[lease.lease_id] = lease
                     return lease
-                # AT_CAPACITY or INELIGIBLE: a lost race, not a credential fault.
+                # AT_CAPACITY, INELIGIBLE or STALE: a lost race, not a credential fault.
                 excluded.add(selected.credential_id)
 
     async def acquire(self, context: SelectionContext | None = None) -> Lease:
@@ -444,11 +466,12 @@ class CredentialPool:
                     lease.acquired_at,
                     max_concurrency=self._concurrency_limit(selected.credential),
                     expires_at=self._expires_at(lease.acquired_at),
+                    secret_fingerprint=getattr(selected.credential, "secret_fingerprint", None),
                 )
                 if reservation is LeaseReservation.RESERVED:
                     self._granted_leases[lease.lease_id] = lease
                     return lease
-                # AT_CAPACITY or INELIGIBLE: a lost race, not a credential fault.
+                # AT_CAPACITY, INELIGIBLE or STALE: a lost race, not a credential fault.
                 excluded.add(selected.credential_id)
 
     def _initialize_record_sync(self, credential_id: str) -> CredentialRecord:

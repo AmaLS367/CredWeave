@@ -13,7 +13,9 @@ Clean Architecture:
 """
 
 import hashlib
+import hmac
 import re
+import secrets
 from collections.abc import Iterable, Iterator, Mapping
 from types import MappingProxyType
 from typing import Any
@@ -99,22 +101,32 @@ _KEY_VALUE_PATTERN = re.compile(
 )
 
 
+_FINGERPRINT_KEY: bytes = secrets.token_bytes(32)
+"""Process-local key for secret fingerprints.
+
+A fingerprint is an HMAC, not a bare hash: API keys and passwords are often low-entropy, so an
+unkeyed digest that leaks (from a lease, a repr or a debugger) could be checked offline against
+guesses. The key is random per process and never leaves memory, so fingerprints are comparable
+only within the process that computed them. They are never persisted by CredWeave.
+"""
+
+
 def compute_secrets_fingerprint(raw_secrets: Mapping[str, Any] | None) -> str:
-    """Compute a deterministic hash fingerprint of raw secrets without exposing content."""
+    """Compute a keyed, process-local fingerprint of raw secrets without exposing content."""
     if not raw_secrets:
         return "empty"
-    hasher = hashlib.sha256()
+    mac = hmac.new(_FINGERPRINT_KEY, digestmod=hashlib.sha256)
     for k in sorted(raw_secrets.keys()):
-        hasher.update(str(k).encode("utf-8", errors="replace"))
-        hasher.update(b"\x00")
+        mac.update(str(k).encode("utf-8", errors="replace"))
+        mac.update(b"\x00")
         val = raw_secrets[k]
         if isinstance(val, (str, bytes)):
             b_val = val if isinstance(val, bytes) else val.encode("utf-8", errors="replace")
         else:
             b_val = repr(val).encode("utf-8", errors="replace")
-        hasher.update(b_val)
-        hasher.update(b"\x00")
-    return hasher.hexdigest()
+        mac.update(b_val)
+        mac.update(b"\x00")
+    return mac.hexdigest()
 
 
 def is_sensitive_key(key: object) -> bool:

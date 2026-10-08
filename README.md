@@ -192,7 +192,7 @@ A credential at its cap is skipped (its health is untouched) until a slot frees 
 
 ## 🔌 Credential Sources
 
-Besides in-memory credentials (`StaticSource`), a pool can load credentials from the environment or a JSON file and **pick up rotations while running**, with no pool recreation and no background thread. Sources are re-read on every acquire; state (usage, cooldowns, health) stays attached to the stable credential `id`.
+Besides in-memory credentials (`StaticSource`), a pool can load credentials from the environment or a JSON file and **pick up rotations while running**, with no pool recreation and no background thread. Sources are re-read on every acquire; state (usage, cooldowns, health) stays attached to the stable credential `id`. A secret that was rotated away from is never re-adopted: a pool still holding an older snapshot gets no leases from it, so it cannot undo a rotation or revive a revoked credential.
 
 ### `EnvSource`: credentials from environment variables
 

@@ -90,6 +90,7 @@ class DummyStore(StateStore):
         *,
         max_concurrency: int | None = None,
         expires_at: datetime | None = None,
+        secret_fingerprint: str | None = None,
     ) -> LeaseReservation:
         rec = self._records.get(credential_id)
         if rec:
@@ -109,6 +110,7 @@ class DummyStore(StateStore):
         *,
         max_concurrency: int | None = None,
         expires_at: datetime | None = None,
+        secret_fingerprint: str | None = None,
     ) -> LeaseReservation:
         return self.reserve_lease(
             credential_id,
@@ -116,6 +118,7 @@ class DummyStore(StateStore):
             timestamp,
             max_concurrency=max_concurrency,
             expires_at=expires_at,
+            secret_fingerprint=secret_fingerprint,
         )
 
     def settle_lease(

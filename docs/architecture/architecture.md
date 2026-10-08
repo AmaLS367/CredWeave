@@ -259,7 +259,8 @@ Pool semantics under reload:
 | Same id, new secrets/metadata | Future leases get the new `Credential`; the store record (usage, cooldown, failures) is kept. |
 | Id removed | No new leases. Existing leases stay reportable and `active_leases` still shows the object they were granted with. The store record is kept, so re-adding the id restores its history. |
 | New id | Eligible immediately; its store record is created lazily. |
-| Change between candidate snapshot and `reserve_lease` | The lease is linearised at snapshot time: it holds that snapshot's `Credential`, accounting is by id and unaffected. |
+| Change between candidate snapshot and `reserve_lease` | The reservation checks the snapshot's secret fingerprint under the store lock. If another pool rotated the credential in between, the candidate is refused (`STALE`) and another one is selected; no lease is ever granted on a superseded secret. |
+| Secret rotated back to an earlier value | Refused. The store keeps the newer generation and gives no lease to the earlier secret, so a stale or reverted source cannot reactivate a revoked credential. A deliberate rollback needs a new store; there is no in-place API for it in v0.1.0. |
 
 ## 4. Architecture Diagram
 

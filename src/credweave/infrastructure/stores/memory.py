@@ -4,7 +4,7 @@ import heapq
 import itertools
 import threading
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any
 
@@ -22,6 +22,18 @@ from credweave.domain.enums import CredentialState
 from credweave.domain.errors import StateStoreError
 from credweave.domain.outcomes import Outcome
 from credweave.infrastructure.clocks.system import SystemClock
+
+
+@dataclass
+class _SecretGenerations:
+    """The secret generations observed for one credential. Guarded by the store lock."""
+
+    current: str
+    """Fingerprint of the secret that leases are granted under."""
+    generation: int
+    """Generation number of ``current``; increases by one on every adopted rotation."""
+    adopted: dict[str, int] = field(default_factory=dict)
+    """Every fingerprint ever adopted for this credential, mapped to its generation."""
 
 
 class MemoryStateStore(StateStore):
@@ -45,6 +57,12 @@ class MemoryStateStore(StateStore):
     under that lock, so a state change racing a selection can never let an ineligible
     credential be leased. Leases carry an optional deadline; expired leases are found through
     a min-heap, so reclamation costs O(log n) per reclaimed lease and O(1) when nothing is due.
+
+    Secret rotation is versioned by generation (see :class:`StateStore`). A fingerprint the
+    store has never seen is adopted as the next generation, which recovers a REVOKED or
+    UNHEALTHY credential. A fingerprint it has already adopted is never re-adopted, so a source
+    still holding an older secret cannot roll the credential back or reactivate it. The
+    adopted history is kept for the life of the store; its size grows by one entry per rotation.
     """
 
     _TOMBSTONE_LIMIT = 4096
@@ -73,7 +91,7 @@ class MemoryStateStore(StateStore):
         self._expiry_heap: list[tuple[datetime, int, str]] = []
         self._heap_counter = itertools.count()
         self._reclaimed: dict[str, None] = {}
-        self._secret_fingerprints: dict[str, str] = {}
+        self._secret_generations: dict[str, _SecretGenerations] = {}
 
     def _check_cooldown_recovery(
         self,
@@ -94,13 +112,17 @@ class MemoryStateStore(StateStore):
         state: CredentialState = CredentialState.AVAILABLE,
         metadata: Mapping[str, Any] | None = None,
     ) -> CredentialRecord:
-        """Register or synchronize credential secret fingerprint, recovering if rotated.
+        """Register or synchronize a credential with the secret fingerprint a source presented.
 
-        If the credential is known and its secret fingerprint has actually changed:
-        - If the credential was REVOKED or UNHEALTHY, it is safely recovered to AVAILABLE,
-          clearing consecutive failures and cooldown.
-        - The new secret fingerprint is recorded.
-        - Active leases granted before this rotation are recognized as pre-rotation leases.
+        - The first fingerprint seen for a credential becomes generation 1.
+        - A fingerprint that differs from the current one and was never adopted before is a
+          rotation: it becomes the next generation. A REVOKED or UNHEALTHY credential is then
+          recovered to AVAILABLE, clearing consecutive failures and cooldown. Leases granted
+          under the previous generation are pre-rotation leases and their outcomes are ignored.
+        - A fingerprint already adopted by an earlier generation is stale (a superseded snapshot,
+          or a secret the credential was rotated away from). It is refused: neither the
+          generation nor the health state changes. This fails closed when the store cannot tell
+          which of two secrets is newer.
         """
         with self._lock:
             existing = self._records.get(credential_id)
@@ -112,16 +134,17 @@ class MemoryStateStore(StateStore):
                 )
                 self._records[credential_id] = record
                 if secret_fingerprint is not None:
-                    self._secret_fingerprints[credential_id] = secret_fingerprint
+                    self._adopt_secret(credential_id, secret_fingerprint)
                 return record
 
             if secret_fingerprint is not None:
-                old_fp = self._secret_fingerprints.get(credential_id)
-                if old_fp is None:
-                    self._secret_fingerprints[credential_id] = secret_fingerprint
-                elif old_fp != secret_fingerprint:
-                    # Secret actually changed!
-                    self._secret_fingerprints[credential_id] = secret_fingerprint
+                generations = self._secret_generations.get(credential_id)
+                if generations is None:
+                    self._adopt_secret(credential_id, secret_fingerprint)
+                elif secret_fingerprint != generations.current and (
+                    secret_fingerprint not in generations.adopted
+                ):
+                    self._adopt_secret(credential_id, secret_fingerprint)
                     # Safely recover revoked or unhealthy credentials
                     if existing.state in (CredentialState.REVOKED, CredentialState.UNHEALTHY):
                         existing = replace(
@@ -133,6 +156,22 @@ class MemoryStateStore(StateStore):
                         self._records[credential_id] = existing
 
             return self._check_cooldown_recovery(existing, self._clock.now())
+
+    def _adopt_secret(self, credential_id: str, secret_fingerprint: str) -> _SecretGenerations:
+        """Make ``secret_fingerprint`` the credential's newest generation. Lock must be held."""
+        generations = self._secret_generations.get(credential_id)
+        if generations is None:
+            generations = _SecretGenerations(
+                current=secret_fingerprint,
+                generation=1,
+                adopted={secret_fingerprint: 1},
+            )
+            self._secret_generations[credential_id] = generations
+        else:
+            generations.generation += 1
+            generations.current = secret_fingerprint
+            generations.adopted[secret_fingerprint] = generations.generation
+        return generations
 
     async def sync_credential_async(
         self,
@@ -240,12 +279,24 @@ class MemoryStateStore(StateStore):
         *,
         max_concurrency: int | None = None,
         expires_at: datetime | None = None,
+        secret_fingerprint: str | None = None,
     ) -> LeaseReservation:
-        """Atomically check eligibility and capacity, then register the lease synchronously."""
+        """Atomically check secret currency, eligibility and capacity, then register the lease."""
         limit = validate_max_concurrency(max_concurrency, "max_concurrency")
         with self._lock:
             if lease_id in self._leases:
                 raise StateStoreError(f"Lease {lease_id!r} is already registered.")
+
+            # The caller's snapshot must still be the credential's current secret. Checked
+            # under the lock, in the same step that grants the slot, so a rotation can never
+            # land between validation and reservation.
+            generations = self._secret_generations.get(credential_id)
+            if (
+                secret_fingerprint is not None
+                and generations is not None
+                and secret_fingerprint != generations.current
+            ):
+                return LeaseReservation.STALE
 
             existing = self._records.get(credential_id)
             if existing is None:
@@ -264,17 +315,20 @@ class MemoryStateStore(StateStore):
             if limit is not None and current.in_flight_leases >= limit:
                 return LeaseReservation.AT_CAPACITY
 
-            fp = self._secret_fingerprints.get(credential_id)
+            if expires_at is not None:
+                # Indexed first: an unorderable deadline raises before anything is mutated.
+                heapq.heappush(self._expiry_heap, (expires_at, next(self._heap_counter), lease_id))
+            if secret_fingerprint is not None and generations is None:
+                # First time the store hears of this credential's secret: it is the baseline.
+                generations = self._adopt_secret(credential_id, secret_fingerprint)
             lease = LeaseRecord(
                 lease_id=lease_id,
                 credential_id=credential_id,
                 acquired_at=timestamp,
                 expires_at=expires_at,
-                secret_fingerprint=fp,
+                secret_fingerprint=generations.current if generations is not None else None,
+                secret_generation=generations.generation if generations is not None else None,
             )
-            if expires_at is not None:
-                # Indexed first: an unorderable deadline raises before anything is mutated.
-                heapq.heappush(self._expiry_heap, (expires_at, next(self._heap_counter), lease_id))
             self._records[credential_id] = replace(
                 current,
                 in_flight_leases=current.in_flight_leases + 1,
@@ -294,14 +348,16 @@ class MemoryStateStore(StateStore):
         *,
         max_concurrency: int | None = None,
         expires_at: datetime | None = None,
+        secret_fingerprint: str | None = None,
     ) -> LeaseReservation:
-        """Atomically check eligibility and capacity, then register the lease asynchronously."""
+        """Atomically check currency, eligibility and capacity, then register asynchronously."""
         return self.reserve_lease(
             credential_id,
             lease_id,
             timestamp,
             max_concurrency=max_concurrency,
             expires_at=expires_at,
+            secret_fingerprint=secret_fingerprint,
         )
 
     def settle_lease(
@@ -331,12 +387,13 @@ class MemoryStateStore(StateStore):
                 )
             expired = lease.expires_at is not None and timestamp > lease.expires_at
 
-            # Check if this lease was granted before a credential rotation
-            current_fp = self._secret_fingerprints.get(credential_id)
+            # A lease granted under an earlier secret generation reports on a superseded secret:
+            # its slot is released but its outcome must not change the current credential.
+            generations = self._secret_generations.get(credential_id)
             is_pre_rotation = (
-                lease.secret_fingerprint is not None
-                and current_fp is not None
-                and lease.secret_fingerprint != current_fp
+                lease.secret_generation is not None
+                and generations is not None
+                and lease.secret_generation != generations.generation
             )
 
             # Compute first: if the lifecycle engine raises, nothing has been mutated and the

@@ -60,6 +60,10 @@ class LeaseRecord:
     acquired_at: datetime
     expires_at: datetime | None = None
     secret_fingerprint: str | None = None
+    secret_generation: int | None = None
+    """The rotation generation of the secret this lease was granted under, or ``None`` when the
+    store had no secret observed for the credential. A lease whose generation is no longer the
+    credential's current one predates a rotation: its outcome is never applied."""
 
 
 class LeaseReservation(Enum):
@@ -80,6 +84,11 @@ class LeaseReservation(Enum):
     """The credential's authoritative current state is not ``AVAILABLE`` (revoked, disabled,
     unhealthy, rate limited, quota exhausted or cooling down)."""
 
+    STALE = "stale"
+    """The secret the caller selected is not the credential's current secret: it was superseded
+    by a later rotation, or it is an earlier secret that the store does not re-adopt. The caller
+    holds an outdated snapshot and must not lease it; nothing changes in the store."""
+
     def __bool__(self) -> bool:
         """Truthy only when the lease was reserved, so a failure is never mistaken for success."""
         return self is LeaseReservation.RESERVED
@@ -89,7 +98,8 @@ class LeaseSettlement(Enum):
     """Result of settling (reporting) a lease against the state store."""
 
     SETTLED = "settled"
-    """The lease was active: the outcome was applied and its slot released."""
+    """The lease was active: its slot was released. The outcome was applied, unless the lease
+    was granted under a secret that has since been rotated, in which case it was discarded."""
 
     EXPIRED = "expired"
     """The lease was past its deadline or already reclaimed: the slot was released (once)
@@ -115,6 +125,15 @@ class StateStore(Protocol):
     from, and always equals, the number of registered leases of that credential. Each method
     of the registry (``reserve_lease``, ``settle_lease``, ``reclaim_expired_leases``) must be
     atomic: it either fully applies or, if it raises, leaves the store unchanged.
+
+    Secrets are versioned per credential by a store-owned *generation*. The store adopts a
+    newly seen secret fingerprint as the next generation and never re-adopts an earlier one, so
+    a stale snapshot cannot roll the credential back. Leases record the generation they were
+    granted under, and ``reserve_lease`` only grants a lease for the current generation.
+
+    Fingerprints are keyed per process (see :mod:`credweave.domain._security`). A store shared
+    by several processes must replace them with fingerprints keyed by a secret all of them share;
+    otherwise every process would see every synchronised secret as a new rotation.
     """
 
     def get_record(self, credential_id: str) -> CredentialRecord | None:
@@ -161,17 +180,21 @@ class StateStore(Protocol):
         *,
         max_concurrency: int | None = None,
         expires_at: datetime | None = None,
+        secret_fingerprint: str | None = None,
     ) -> LeaseReservation:
-        """Atomically check eligibility and capacity, then register the lease synchronously.
+        """Atomically check secret currency, eligibility and capacity, then register the lease.
 
         In one atomic step, against the authoritative current record:
 
+        0. if ``secret_fingerprint`` is given and is not the credential's current secret, ``STALE``
+           is returned: the caller selected a snapshot that has since been superseded;
         1. a timed cooldown that has elapsed at ``timestamp`` is recovered to ``AVAILABLE``;
         2. the state must then be ``AVAILABLE``, otherwise ``INELIGIBLE`` is returned;
         3. the in-flight count must be below ``max_concurrency`` (``None`` means unlimited),
            otherwise ``AT_CAPACITY`` is returned;
         4. only then are in-flight and total leases incremented, ``last_used_at`` stamped and
-           ``lease_id`` registered (reclaimable once ``expires_at`` has passed).
+           ``lease_id`` registered (reclaimable once ``expires_at`` has passed), recording the
+           secret generation the lease was granted under.
 
         A credential never being seen by the store counts as a fresh ``AVAILABLE`` one. A
         non-``RESERVED`` result changes nothing: no counter, no registry entry and no health
@@ -191,8 +214,9 @@ class StateStore(Protocol):
         *,
         max_concurrency: int | None = None,
         expires_at: datetime | None = None,
+        secret_fingerprint: str | None = None,
     ) -> LeaseReservation:
-        """Atomically check eligibility and capacity, then register the lease asynchronously."""
+        """Atomically check currency, eligibility and capacity, then register asynchronously."""
         ...
 
     def settle_lease(
@@ -206,9 +230,11 @@ class StateStore(Protocol):
 
         An active, unexpired lease is unregistered, its slot released and ``outcome`` applied
         in one step (``SETTLED``). A lease past its deadline, or already reclaimed, releases its
-        slot at most once and applies no outcome (``EXPIRED``). Leases that are not active
-        (``UNKNOWN``) or that belong to another credential (``MISMATCH``) change nothing. If
-        this method raises, the lease stays registered so the caller can retry.
+        slot at most once and applies no outcome (``EXPIRED``). A lease granted under an earlier
+        secret generation than the credential's current one also releases its slot but applies
+        no outcome (``SETTLED``), since its outcome describes a superseded secret. Leases that
+        are not active (``UNKNOWN``) or that belong to another credential (``MISMATCH``) change
+        nothing. If this method raises, the lease stays registered so the caller can retry.
         """
         ...
 
