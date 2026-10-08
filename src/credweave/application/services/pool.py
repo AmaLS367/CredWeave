@@ -381,6 +381,11 @@ class CredentialPool:
                 for cred in credentials:
                     if cred.id not in records:
                         records[cred.id] = self._initialize_record_sync(cred.id)
+                    fp = getattr(cred, "secret_fingerprint", None)
+                    if fp is not None and hasattr(self._store, "sync_credential"):
+                        records[cred.id] = self._store.sync_credential(
+                            cred.id, secret_fingerprint=fp
+                        )
 
                 candidates = self._build_candidates(credentials, records, excluded)
                 selected = self._strategy.select(candidates, context)
@@ -415,6 +420,16 @@ class CredentialPool:
                 for cred in credentials:
                     if cred.id not in records:
                         records[cred.id] = await self._initialize_record_async(cred.id)
+                    fp = getattr(cred, "secret_fingerprint", None)
+                    if fp is not None:
+                        if hasattr(self._store, "sync_credential_async"):
+                            records[cred.id] = await self._store.sync_credential_async(
+                                cred.id, secret_fingerprint=fp
+                            )
+                        elif hasattr(self._store, "sync_credential"):
+                            records[cred.id] = self._store.sync_credential(
+                                cred.id, secret_fingerprint=fp
+                            )
 
                 candidates = self._build_candidates(credentials, records, excluded)
                 with self._pool_lock:  # strategies are shared with concurrent sync acquirers

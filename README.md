@@ -16,7 +16,7 @@
 [Design Philosophy](#-core-design-philosophy) •
 [Quickstart](#-quickstart) •
 [Architecture](#️-clean-architecture) •
-[Security](#️-security--zero-leak-guarantees) •
+[Security](#️-security--defense-in-depth-guarantees) •
 [Roadmap](docs/ROADMAP.md) •
 [Contributing](docs/CONTRIBUTING.md)
 
@@ -252,9 +252,9 @@ print(source.reload_status)  # generation, last_error, consecutive_failures
 
 ---
 
-## 🛡️ Security & Zero-Leak Guarantees
+## 🛡️ Security & Defense-in-Depth Guarantees
 
-Handling API keys, bearer tokens, and secrets requires strict security invariants:
+Handling API keys, bearer tokens, and secrets requires strict security invariants and defense-in-depth:
 
 ### 1. Automatic Secret Masking
 Secret dictionary keys are visible for debugging, but secret values are masked as `'***'` in all representations (`__repr__`, `__str__`):
@@ -275,10 +275,10 @@ repr(cred)
 Secret values are accessed explicitly via `cred.get_secret("key")`. Attempting to retrieve a missing key raises a clean `SecretAccessError` without exposing environment state.
 
 ### 3. Exception & Log Sanitization
-Exception classes across CredWeave never format or interpolate raw secret values into error messages.
+Exception classes across CredWeave never format or interpolate raw secret values into error messages. Known secret values and identifiable token patterns are redacted from representations and diagnostics.
 
-### 4. Immutability
-All credential dictionaries and views are frozen and immutable, preventing accidental runtime mutation or tampering.
+### 4. Deep Immutability
+All credential dictionaries, views, and nested metadata structures are deeply frozen and immutable, preventing accidental runtime mutation or tampering.
 
 ---
 

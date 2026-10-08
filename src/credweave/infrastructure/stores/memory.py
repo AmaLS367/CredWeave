@@ -73,6 +73,7 @@ class MemoryStateStore(StateStore):
         self._expiry_heap: list[tuple[datetime, int, str]] = []
         self._heap_counter = itertools.count()
         self._reclaimed: dict[str, None] = {}
+        self._secret_fingerprints: dict[str, str] = {}
 
     def _check_cooldown_recovery(
         self,
@@ -84,6 +85,70 @@ class MemoryStateStore(StateStore):
         if recovered is not record:
             self._records[record.credential_id] = recovered
         return recovered
+
+    def sync_credential(
+        self,
+        credential_id: str,
+        secret_fingerprint: str | None = None,
+        *,
+        state: CredentialState = CredentialState.AVAILABLE,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> CredentialRecord:
+        """Register or synchronize credential secret fingerprint, recovering if rotated.
+
+        If the credential is known and its secret fingerprint has actually changed:
+        - If the credential was REVOKED or UNHEALTHY, it is safely recovered to AVAILABLE,
+          clearing consecutive failures and cooldown.
+        - The new secret fingerprint is recorded.
+        - Active leases granted before this rotation are recognized as pre-rotation leases.
+        """
+        with self._lock:
+            existing = self._records.get(credential_id)
+            if existing is None:
+                record = CredentialRecord(
+                    credential_id=credential_id,
+                    state=state,
+                    metadata=metadata or {},
+                )
+                self._records[credential_id] = record
+                if secret_fingerprint is not None:
+                    self._secret_fingerprints[credential_id] = secret_fingerprint
+                return record
+
+            if secret_fingerprint is not None:
+                old_fp = self._secret_fingerprints.get(credential_id)
+                if old_fp is None:
+                    self._secret_fingerprints[credential_id] = secret_fingerprint
+                elif old_fp != secret_fingerprint:
+                    # Secret actually changed!
+                    self._secret_fingerprints[credential_id] = secret_fingerprint
+                    # Safely recover revoked or unhealthy credentials
+                    if existing.state in (CredentialState.REVOKED, CredentialState.UNHEALTHY):
+                        existing = replace(
+                            existing,
+                            state=CredentialState.AVAILABLE,
+                            consecutive_failures=0,
+                            cooldown_until=None,
+                        )
+                        self._records[credential_id] = existing
+
+            return self._check_cooldown_recovery(existing, self._clock.now())
+
+    async def sync_credential_async(
+        self,
+        credential_id: str,
+        secret_fingerprint: str | None = None,
+        *,
+        state: CredentialState = CredentialState.AVAILABLE,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> CredentialRecord:
+        """Synchronize credential state and secret fingerprint asynchronously."""
+        return self.sync_credential(
+            credential_id,
+            secret_fingerprint,
+            state=state,
+            metadata=metadata,
+        )
 
     def initialize_record(
         self,
@@ -199,11 +264,13 @@ class MemoryStateStore(StateStore):
             if limit is not None and current.in_flight_leases >= limit:
                 return LeaseReservation.AT_CAPACITY
 
+            fp = self._secret_fingerprints.get(credential_id)
             lease = LeaseRecord(
                 lease_id=lease_id,
                 credential_id=credential_id,
                 acquired_at=timestamp,
                 expires_at=expires_at,
+                secret_fingerprint=fp,
             )
             if expires_at is not None:
                 # Indexed first: an unorderable deadline raises before anything is mutated.
@@ -263,11 +330,20 @@ class MemoryStateStore(StateStore):
                     state=CredentialState.AVAILABLE,
                 )
             expired = lease.expires_at is not None and timestamp > lease.expires_at
+
+            # Check if this lease was granted before a credential rotation
+            current_fp = self._secret_fingerprints.get(credential_id)
+            is_pre_rotation = (
+                lease.secret_fingerprint is not None
+                and current_fp is not None
+                and lease.secret_fingerprint != current_fp
+            )
+
             # Compute first: if the lifecycle engine raises, nothing has been mutated and the
             # lease stays registered, so the caller can retry without leaking or double-releasing.
             updated = (
                 self._lifecycle.reclaim(record)
-                if expired
+                if (expired or is_pre_rotation)
                 else self._lifecycle.apply_outcome(record, outcome, timestamp)
             )
             self._records[credential_id] = updated

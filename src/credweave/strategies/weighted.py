@@ -1,5 +1,4 @@
-"""Deterministic smooth weighted round-robin selection strategy."""
-
+import math
 import threading
 from collections.abc import Sequence
 
@@ -49,14 +48,46 @@ class WeightedStrategy(SelectionStrategy):
         if not eligible:
             return None
 
-        weights = [candidate_weight(c, self._weight_key, self._default_weight) for c in eligible]
+        raw_weights = [
+            candidate_weight(c, self._weight_key, self._default_weight) for c in eligible
+        ]
+
+        # Guard against numerical overflow and precision underflow
+        # If sum overflows to infinity or weights are extreme, scale by max_weight
+        max_weight = max(raw_weights)
+        if not math.isfinite(sum(raw_weights)) or max_weight > 1e100 or max_weight < 1e-50:
+            scale = max_weight if max_weight > 0 else 1.0
+            weights = [w / scale for w in raw_weights]
+        else:
+            weights = raw_weights
+
         total = sum(weights)
+        if not math.isfinite(total) or total <= 0:
+            weights = [1.0 for _ in weights]
+            total = float(len(weights))
 
         with self._lock:
             # Forget scheduling state of credentials that left the pool entirely.
             known = {c.credential_id for c in candidates}
             for stale in [cid for cid in self._current if cid not in known]:
                 del self._current[stale]
+
+            # Prevent unbounded drift or NaN/Inf accumulation:
+            # Clamp current weights of eligible candidates within [-2 * total, 2 * total]
+            for cand in eligible:
+                val = self._current.get(cand.credential_id, 0.0)
+                if not math.isfinite(val) or val > total * 2 or val < -total * 2:
+                    self._current[cand.credential_id] = 0.0
+
+            # Zero-sum drift correction: in smooth round robin, sum of current weights
+            # across active eligible candidates is mathematically invariant to 0.
+            current_sum = sum(self._current.get(cand.credential_id, 0.0) for cand in eligible)
+            if abs(current_sum) > 1e-7:
+                shift = current_sum / len(eligible)
+                for cand in eligible:
+                    self._current[cand.credential_id] = (
+                        self._current.get(cand.credential_id, 0.0) - shift
+                    )
 
             best_index = 0
             best_value = float("-inf")

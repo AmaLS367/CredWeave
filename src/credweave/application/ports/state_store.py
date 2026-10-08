@@ -25,12 +25,11 @@ class CredentialRecord:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not isinstance(self.metadata, SecretSafeMapping):
-            object.__setattr__(
-                self,
-                "metadata",
-                SecretSafeMapping(self.metadata),
-            )
+        object.__setattr__(
+            self,
+            "metadata",
+            SecretSafeMapping(self.metadata),
+        )
 
     def __repr__(self) -> str:
         """Return secret-safe string representation."""
@@ -60,6 +59,7 @@ class LeaseRecord:
     credential_id: str
     acquired_at: datetime
     expires_at: datetime | None = None
+    secret_fingerprint: str | None = None
 
 
 class LeaseReservation(Enum):

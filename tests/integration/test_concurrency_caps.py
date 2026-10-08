@@ -69,7 +69,7 @@ def _acquire_with_retry(pool: CredentialPool, deadline: float) -> Lease:
         except NoCredentialsAvailableError:
             if time.monotonic() > deadline:
                 raise
-            time.sleep(0)
+            time.sleep(0.0005)
 
 
 async def _acquire_with_retry_async(pool: CredentialPool, deadline: float) -> Lease:

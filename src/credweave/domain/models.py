@@ -1,6 +1,6 @@
 """Domain models representing credentials and active credential leases.
 
-Security Guarantee:
+Security Invariants:
     Secret values stored in :class:`Credential` are never rendered in
     :meth:`Credential.__repr__` or :meth:`Credential.__str__`. All secret
     values are replaced with masked placeholders (``'***'``).
@@ -12,7 +12,11 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import Any
 
-from credweave.domain._security import SecretSafeMapping, mask_metadata
+from credweave.domain._security import (
+    SecretSafeMapping,
+    compute_secrets_fingerprint,
+    mask_metadata,
+)
 from credweave.domain.errors import ConfigurationError, SecretAccessError
 
 
@@ -35,7 +39,7 @@ class Credential:
         are considered equivalent for hashing, set operations, and dictionary keys.
     """
 
-    __slots__ = ("_id", "_metadata", "_raw_secrets", "_secrets")
+    __slots__ = ("_id", "_metadata", "_raw_secrets", "_secret_fingerprint", "_secrets")
 
     def __init__(
         self,
@@ -56,6 +60,7 @@ class Credential:
         self._metadata: Mapping[str, Any] = SecretSafeMapping(
             metadata or {}, raw_secrets=raw_secrets.values()
         )
+        self._secret_fingerprint: str = compute_secrets_fingerprint(raw_secrets)
 
     @property
     def id(self) -> str:
@@ -76,6 +81,11 @@ class Credential:
     def secret_keys(self) -> frozenset[str]:
         """Set of available secret key names without revealing their secret values."""
         return frozenset(self._raw_secrets.keys())
+
+    @property
+    def secret_fingerprint(self) -> str:
+        """Deterministic fingerprint of secret values for rotation detection."""
+        return self._secret_fingerprint
 
     @property
     def metadata(self) -> Mapping[str, Any]:
@@ -151,12 +161,11 @@ class Lease:
             raise ConfigurationError("Lease lease_id must be a non-empty string.")
         raw_secrets = getattr(self.credential, "_raw_secrets", {})
         secret_values = raw_secrets.values() if hasattr(raw_secrets, "values") else ()
-        if not isinstance(self.metadata, SecretSafeMapping):
-            object.__setattr__(
-                self,
-                "metadata",
-                SecretSafeMapping(self.metadata, raw_secrets=secret_values),
-            )
+        object.__setattr__(
+            self,
+            "metadata",
+            SecretSafeMapping(self.metadata, raw_secrets=secret_values),
+        )
 
     @property
     def credential_id(self) -> str:

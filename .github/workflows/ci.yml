@@ -49,9 +49,15 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install ".[dev]"
 
-      - name: Run pytest with branch coverage
+      - name: Run pytest with branch coverage (Python 3.13)
+        if: matrix.python-version == '3.13'
         run: |
           pytest --cov=credweave --cov-branch --cov-report=term-missing --cov-fail-under=90
+
+      - name: Run pytest (Python ${{ matrix.python-version }})
+        if: matrix.python-version != '3.13'
+        run: |
+          pytest
 
   lint:
     name: Ruff & Mypy
@@ -103,13 +109,14 @@ jobs:
       - name: Build sdist and wheel
         run: python -m build
 
-      - name: Verify wheel installation and clean import
+      - name: Verify wheel installation and clean import outside source tree
         run: |
-          python -m pip install dist/*.whl
-          python -c "import credweave; print(f'Successfully imported credweave {credweave.__version__} from wheel')"
-          python -m pip uninstall -y credweave
+          python -m venv "${RUNNER_TEMP}/wheel-test-env"
+          "${RUNNER_TEMP}/wheel-test-env/bin/python" -m pip install dist/*.whl
+          (cd "${RUNNER_TEMP}" && "${RUNNER_TEMP}/wheel-test-env/bin/python" -c "import credweave; print(f'Successfully imported credweave {credweave.__version__} from wheel at {credweave.__file__}')")
 
-      - name: Verify sdist installation and clean import
+      - name: Verify sdist installation and clean import outside source tree
         run: |
-          python -m pip install dist/*.tar.gz
-          python -c "import credweave; print(f'Successfully imported credweave {credweave.__version__} from sdist')"
+          python -m venv "${RUNNER_TEMP}/sdist-test-env"
+          "${RUNNER_TEMP}/sdist-test-env/bin/python" -m pip install dist/*.tar.gz
+          (cd "${RUNNER_TEMP}" && "${RUNNER_TEMP}/sdist-test-env/bin/python" -c "import credweave; print(f'Successfully imported credweave {credweave.__version__} from sdist at {credweave.__file__}')")

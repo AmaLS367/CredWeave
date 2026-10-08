@@ -1,5 +1,4 @@
-"""Random credential selection strategy."""
-
+import math
 import random as _random
 import threading
 from collections.abc import Sequence
@@ -68,6 +67,15 @@ class RandomStrategy(SelectionStrategy):
             with self._lock:
                 return self._rng.choice(eligible)
 
-        weights = [candidate_weight(c, self._weight_key, self._default_weight) for c in eligible]
+        raw_weights = [
+            candidate_weight(c, self._weight_key, self._default_weight) for c in eligible
+        ]
+        max_weight = max(raw_weights)
+        if not math.isfinite(sum(raw_weights)) or max_weight > 1e100 or max_weight < 1e-50:
+            scale = max_weight if max_weight > 0 else 1.0
+            weights = [w / scale for w in raw_weights]
+        else:
+            weights = raw_weights
+
         with self._lock:
             return self._rng.choices(eligible, weights=weights, k=1)[0]

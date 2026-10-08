@@ -73,12 +73,11 @@ class Outcome:
         if self.retry_after is not None:
             object.__setattr__(self, "retry_after", _validate_retry_after(self.retry_after))
 
-        if not isinstance(self.metadata, SecretSafeMapping):
-            object.__setattr__(
-                self,
-                "metadata",
-                SecretSafeMapping(self.metadata),
-            )
+        object.__setattr__(
+            self,
+            "metadata",
+            SecretSafeMapping(self.metadata),
+        )
 
     def redact(self, secrets: Iterable[str] = ()) -> "Outcome":
         """Return a copy of this Outcome with all occurrences of secrets redacted."""
