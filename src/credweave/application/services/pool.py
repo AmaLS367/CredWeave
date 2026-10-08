@@ -1,12 +1,14 @@
 """Application service coordinating credential leasing, rotation, and lifecycle reporting."""
 
 import asyncio
+import inspect
 import math
 import threading
 import uuid
 import weakref
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta
+from typing import Any
 
 from credweave.application.ports.clock import Clock
 from credweave.application.ports.credential_source import CredentialSource
@@ -32,6 +34,7 @@ from credweave.domain.enums import CredentialState
 from credweave.domain.errors import (
     ConfigurationError,
     CredentialAlreadyExistsError,
+    CredentialNotFoundError,
     CredentialSourceError,
     InvalidLeaseError,
     InvalidOutcomeError,
@@ -107,10 +110,19 @@ class CredentialPool:
         lifecycle engine of the default state store. A custom ``store`` carries its own
         :class:`LifecycleEngine`.
 
+        Construction reads the source once, to record the secrets it presents as the baseline
+        for rotation safety; a source error is raised, not deferred. A rotation never recovers a
+        ``REVOKED`` or ``UNHEALTHY`` credential: call :meth:`authorize_secret` once the secret is
+        repaired. A custom ``store`` must implement the secret-generation contract documented on
+        :class:`~credweave.application.ports.state_store.StateStore`, or construction fails.
+
         Lease slots live in the state store, so concurrency caps and lease reclamation hold across
         every pool, thread and asyncio task sharing one store. Expired leases are reclaimed
         automatically during acquire and report; no background task is involved.
     """
+
+    _AUTHORIZE_ATTEMPTS = 8
+    """How many times :meth:`authorize_secret` re-reads a source that keeps changing."""
 
     def __init__(
         self,
@@ -189,6 +201,8 @@ class CredentialPool:
                 "No store provided and no default store adapter is registered."
             )
 
+        self._require_secret_generation_contract()
+
         self._max_concurrency_per_credential = validate_max_concurrency(
             max_concurrency_per_credential, "max_concurrency_per_credential"
         )
@@ -216,22 +230,113 @@ class CredentialPool:
 
         self._observe_starting_secrets()
 
-    def _observe_starting_secrets(self) -> None:
-        """Make the store aware of the secrets this pool starts with.
+    def _require_secret_generation_contract(self) -> None:
+        """Refuse a store that cannot version secrets, rather than run without rotation safety.
 
-        The store cannot order two secrets it has never seen, so a snapshot read long before
-        another pool rotated would be adopted as the newer secret. Observing the starting secrets
-        at construction lets the store recognise such a snapshot as superseded. A source that
-        cannot be read yet is skipped: the next acquire reads it again and reports the error.
+        Every acquire synchronises the source's fingerprint with ``sync_credential`` and passes
+        the candidate's fingerprint to ``reserve_lease``. A store lacking either would silently
+        lose stale-snapshot and rollback protection.
         """
-        if not hasattr(self._store, "sync_credential"):
-            return
-        try:
-            credentials = self._source.get_credentials()
-        except CredentialSourceError:
-            return
-        for cred in credentials:
-            self._store.sync_credential(cred.id, secret_fingerprint=cred.secret_fingerprint)
+        missing: list[str] = []
+        if getattr(self._store, "sync_credential", None) is None:
+            missing.append("sync_credential()")
+        parameters = inspect.signature(self._store.reserve_lease).parameters.values()
+        accepts_fingerprint = any(
+            p.name == "secret_fingerprint" or p.kind is inspect.Parameter.VAR_KEYWORD
+            for p in parameters
+        )
+        if not accepts_fingerprint:
+            missing.append("a secret_fingerprint argument on reserve_lease()")
+        if missing:
+            raise ConfigurationError(
+                "The state store does not implement secret generations: missing "
+                f"{' and '.join(missing)}. See the StateStore docstring for the contract."
+            )
+
+    def _observe_starting_secrets(self) -> None:
+        """Make the store aware of the secrets the source presents when the pool is built.
+
+        This is the one source read made at construction, and it is deliberate. A secret the
+        source presented before the store first synchronised with it could otherwise be adopted
+        as a rotation when the source reverts to it. Errors propagate: a pool whose baseline
+        cannot be established is not built, so no error is silently deferred.
+        """
+        sync = self._store_method("sync_credential")
+        for cred in self._source.get_credentials():
+            sync(cred.id, secret_fingerprint=cred.secret_fingerprint)
+
+    def _source_fingerprint(self, credential_id: str) -> str:
+        """Return the secret fingerprint the source presents for ``credential_id`` now."""
+        for cred in self._source.get_credentials():
+            if cred.id == credential_id:
+                return cred.secret_fingerprint
+        raise CredentialNotFoundError(credential_id)
+
+    async def _source_fingerprint_async(self, credential_id: str) -> str:
+        """Asynchronous equivalent of :meth:`_source_fingerprint`."""
+        for cred in await self._source.get_credentials_async():
+            if cred.id == credential_id:
+                return cred.secret_fingerprint
+        raise CredentialNotFoundError(credential_id)
+
+    def authorize_secret(self, credential_id: str) -> CredentialRecord:
+        """Explicitly activate the secret the source presents for ``credential_id``.
+
+        This is how a REVOKED or UNHEALTHY credential is recovered after its secret was repaired
+        or replaced: rotation alone never recovers it. The secret becomes the active generation
+        and the credential is reset to AVAILABLE. To roll back, restore the earlier secret in the
+        source first. It then gets a new generation, so leases granted under its earlier
+        generation remain isolated and their outcomes are still ignored.
+
+        The source is read again after the store is updated. If the secret changed in between,
+        the newer one is authorized instead, so the store never stays on a secret the source has
+        already moved away from.
+
+        Raises:
+            CredentialNotFoundError: The source does not present ``credential_id``.
+            CredentialSourceError: The source cannot be read, or it kept changing throughout.
+        """
+        authorize = self._store_method("authorize_secret")
+        # Held like acquire's selection, so a concurrent acquire of this pool cannot read and
+        # synchronise a secret in between the read and the adoption made here.
+        with self._pool_lock:
+            fingerprint = self._source_fingerprint(credential_id)
+            for _ in range(self._AUTHORIZE_ATTEMPTS):
+                record: CredentialRecord = authorize(credential_id, fingerprint)
+                latest = self._source_fingerprint(credential_id)
+                if latest == fingerprint:
+                    return record
+                fingerprint = latest
+        raise CredentialSourceError(
+            f"The source for credential {credential_id!r} kept changing during authorization."
+        )
+
+    async def authorize_secret_async(self, credential_id: str) -> CredentialRecord:
+        """Asynchronous equivalent of :meth:`authorize_secret`."""
+        authorize_async = getattr(self._store, "authorize_secret_async", None)
+        authorize = self._store_method("authorize_secret")
+        async with self._get_async_lock():  # as in acquire(): no interleaving within this pool
+            fingerprint = await self._source_fingerprint_async(credential_id)
+            for _ in range(self._AUTHORIZE_ATTEMPTS):
+                record: CredentialRecord
+                if authorize_async is not None:
+                    record = await authorize_async(credential_id, fingerprint)
+                else:
+                    record = authorize(credential_id, fingerprint)
+                latest = await self._source_fingerprint_async(credential_id)
+                if latest == fingerprint:
+                    return record
+                fingerprint = latest
+        raise CredentialSourceError(
+            f"The source for credential {credential_id!r} kept changing during authorization."
+        )
+
+    def _store_method(self, name: str) -> Any:
+        """Return the store's ``name`` method, or fail closed when the store does not offer it."""
+        method = getattr(self._store, name, None)
+        if method is None:
+            raise ConfigurationError(f"The state store does not implement {name}().")
+        return method
 
     def _validate_lease_timeout(self, lease_timeout: float | None) -> timedelta | None:
         if lease_timeout is None:

@@ -1,6 +1,7 @@
 """Tests for edge cases and branch coverage across pool, store, and strategies."""
 
 from datetime import datetime, timedelta
+from typing import Any
 
 import pytest
 
@@ -37,6 +38,18 @@ class DummyStore(StateStore):
     def __init__(self) -> None:
         self._records: dict[str, CredentialRecord] = {}
         self._leases: dict[str, LeaseRecord] = {}
+
+    def sync_credential(
+        self,
+        credential_id: str,
+        secret_fingerprint: str | None = None,
+        **_: Any,
+    ) -> CredentialRecord:
+        """Register the record only: this minimal fake keeps no secret generations."""
+        return self._records.setdefault(
+            credential_id,
+            CredentialRecord(credential_id=credential_id, state=CredentialState.AVAILABLE),
+        )
 
     def get_record(self, credential_id: str) -> CredentialRecord | None:
         return self._records.get(credential_id)

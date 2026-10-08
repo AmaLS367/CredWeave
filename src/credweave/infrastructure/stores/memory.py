@@ -31,9 +31,13 @@ class _SecretGenerations:
     current: str
     """Fingerprint of the secret that leases are granted under."""
     generation: int
-    """Generation number of ``current``; increases by one on every adopted rotation."""
+    """Generation number of ``current``. Only ever increases, so a number is never reused."""
     adopted: dict[str, int] = field(default_factory=dict)
-    """Every fingerprint ever adopted for this credential, mapped to its generation."""
+    """Recently adopted fingerprints, oldest first, mapped to their generation. ``current`` is
+    always the last entry. Bounded by ``MemoryStateStore._SECRET_HISTORY_LIMIT``."""
+    truncated: bool = False
+    """True once an adopted fingerprint has been forgotten. An unseen fingerprint can then be
+    a replay of a forgotten secret, so automatic synchronisation refuses it."""
 
 
 class MemoryStateStore(StateStore):
@@ -59,14 +63,23 @@ class MemoryStateStore(StateStore):
     a min-heap, so reclamation costs O(log n) per reclaimed lease and O(1) when nothing is due.
 
     Secret rotation is versioned by generation (see :class:`StateStore`). A fingerprint the
-    store has never seen is adopted as the next generation, which recovers a REVOKED or
-    UNHEALTHY credential. A fingerprint it has already adopted is never re-adopted, so a source
-    still holding an older secret cannot roll the credential back or reactivate it. The
-    adopted history is kept for the life of the store; its size grows by one entry per rotation.
+    store has never seen is adopted as the next generation, but a rotation never changes a
+    credential's lifecycle state: a REVOKED or UNHEALTHY credential is recovered only by
+    :meth:`authorize_secret` (or :meth:`reset`). A fingerprint it has already adopted is never
+    re-adopted by synchronisation, so a source still holding an older secret cannot roll the
+    credential back or reactivate it.
+
+    The adopted history is bounded to ``_SECRET_HISTORY_LIMIT`` fingerprints per credential.
+    Past that limit the oldest is forgotten and synchronisation refuses unseen fingerprints
+    (fail closed), so a forgotten secret cannot be replayed in automatically; explicit
+    :meth:`authorize_secret` still works.
     """
 
     _TOMBSTONE_LIMIT = 4096
     """How many reclaimed lease ids are remembered to tell a late report from an unknown one."""
+
+    _SECRET_HISTORY_LIMIT = 1024
+    """How many adopted secret fingerprints are remembered per credential."""
 
     def __init__(
         self,
@@ -114,51 +127,51 @@ class MemoryStateStore(StateStore):
     ) -> CredentialRecord:
         """Register or synchronize a credential with the secret fingerprint a source presented.
 
+        Synchronisation never changes lifecycle state. Use :meth:`authorize_secret` to recover
+        a REVOKED or UNHEALTHY credential.
+
         - The first fingerprint seen for a credential becomes generation 1.
-        - A fingerprint that differs from the current one and was never adopted before is a
-          rotation: it becomes the next generation. A REVOKED or UNHEALTHY credential is then
-          recovered to AVAILABLE, clearing consecutive failures and cooldown. Leases granted
-          under the previous generation are pre-rotation leases and their outcomes are ignored.
-        - A fingerprint already adopted by an earlier generation is stale (a superseded snapshot,
-          or a secret the credential was rotated away from). It is refused: neither the
-          generation nor the health state changes. This fails closed when the store cannot tell
-          which of two secrets is newer.
+        - A fingerprint never adopted before is a rotation and becomes the next generation.
+          Leases granted under the previous generation are then pre-rotation leases and their
+          outcomes are ignored.
+        - A fingerprint already adopted is stale (a superseded snapshot, or a secret the
+          credential was rotated away from) and is refused: nothing changes.
+        - An unseen fingerprint is also refused once the adopted history has been truncated,
+          because it may be a replay of a forgotten secret. This fails closed.
         """
         with self._lock:
             existing = self._records.get(credential_id)
             if existing is None:
-                record = CredentialRecord(
+                existing = CredentialRecord(
                     credential_id=credential_id,
                     state=state,
                     metadata=metadata or {},
                 )
-                self._records[credential_id] = record
-                if secret_fingerprint is not None:
-                    self._adopt_secret(credential_id, secret_fingerprint)
-                return record
-
+                self._records[credential_id] = existing
             if secret_fingerprint is not None:
-                generations = self._secret_generations.get(credential_id)
-                if generations is None:
-                    self._adopt_secret(credential_id, secret_fingerprint)
-                elif secret_fingerprint != generations.current and (
-                    secret_fingerprint not in generations.adopted
-                ):
-                    self._adopt_secret(credential_id, secret_fingerprint)
-                    # Safely recover revoked or unhealthy credentials
-                    if existing.state in (CredentialState.REVOKED, CredentialState.UNHEALTHY):
-                        existing = replace(
-                            existing,
-                            state=CredentialState.AVAILABLE,
-                            consecutive_failures=0,
-                            cooldown_until=None,
-                        )
-                        self._records[credential_id] = existing
-
+                self._observe_secret(credential_id, secret_fingerprint)
             return self._check_cooldown_recovery(existing, self._clock.now())
 
+    def _observe_secret(self, credential_id: str, secret_fingerprint: str) -> None:
+        """Adopt a fingerprint a source presented, unless it is stale. Lock must be held."""
+        generations = self._secret_generations.get(credential_id)
+        if generations is None:
+            self._adopt_secret(credential_id, secret_fingerprint)
+            return
+        if secret_fingerprint in generations.adopted:
+            # The current secret or a superseded one: never re-adopted by synchronisation.
+            return
+        if generations.truncated:
+            # The history cannot rule out a replay of a forgotten secret: fail closed.
+            return
+        self._adopt_secret(credential_id, secret_fingerprint)
+
     def _adopt_secret(self, credential_id: str, secret_fingerprint: str) -> _SecretGenerations:
-        """Make ``secret_fingerprint`` the credential's newest generation. Lock must be held."""
+        """Make ``secret_fingerprint`` the credential's newest generation. Lock must be held.
+
+        Re-adopting an earlier secret (a rollback) gives it a new generation number, so leases
+        granted under its earlier number stay isolated from the current generation.
+        """
         generations = self._secret_generations.get(credential_id)
         if generations is None:
             generations = _SecretGenerations(
@@ -167,10 +180,14 @@ class MemoryStateStore(StateStore):
                 adopted={secret_fingerprint: 1},
             )
             self._secret_generations[credential_id] = generations
-        else:
-            generations.generation += 1
-            generations.current = secret_fingerprint
-            generations.adopted[secret_fingerprint] = generations.generation
+            return generations
+        generations.generation += 1
+        generations.current = secret_fingerprint
+        generations.adopted.pop(secret_fingerprint, None)
+        generations.adopted[secret_fingerprint] = generations.generation
+        while len(generations.adopted) > self._SECRET_HISTORY_LIMIT:
+            del generations.adopted[next(iter(generations.adopted))]
+            generations.truncated = True
         return generations
 
     async def sync_credential_async(
@@ -188,6 +205,43 @@ class MemoryStateStore(StateStore):
             state=state,
             metadata=metadata,
         )
+
+    def authorize_secret(self, credential_id: str, secret_fingerprint: str) -> CredentialRecord:
+        """Explicitly make ``secret_fingerprint`` the active secret and reset the credential.
+
+        This is the only operation that recovers a REVOKED or UNHEALTHY credential because its
+        secret changed. Unlike :meth:`sync_credential` it accepts an earlier secret too, which is
+        how a deliberate rollback is made. Such a secret gets a new generation number, so leases
+        granted under its earlier number remain isolated. Authorizing the secret that is already
+        current changes no generation; it only resets the lifecycle state.
+
+        The state becomes AVAILABLE, with consecutive failures and cooldown cleared. In-flight and
+        total lease counters are kept.
+        """
+        with self._lock:
+            generations = self._secret_generations.get(credential_id)
+            if generations is None or generations.current != secret_fingerprint:
+                self._adopt_secret(credential_id, secret_fingerprint)
+            existing = self._records.get(credential_id) or CredentialRecord(
+                credential_id=credential_id,
+                state=CredentialState.AVAILABLE,
+            )
+            record = replace(
+                existing,
+                state=CredentialState.AVAILABLE,
+                consecutive_failures=0,
+                cooldown_until=None,
+            )
+            self._records[credential_id] = record
+            return record
+
+    async def authorize_secret_async(
+        self,
+        credential_id: str,
+        secret_fingerprint: str,
+    ) -> CredentialRecord:
+        """Explicitly make a secret active and reset the credential, asynchronously."""
+        return self.authorize_secret(credential_id, secret_fingerprint)
 
     def initialize_record(
         self,

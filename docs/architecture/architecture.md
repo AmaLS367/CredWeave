@@ -260,7 +260,12 @@ Pool semantics under reload:
 | Id removed | No new leases. Existing leases stay reportable and `active_leases` still shows the object they were granted with. The store record is kept, so re-adding the id restores its history. |
 | New id | Eligible immediately; its store record is created lazily. |
 | Change between candidate snapshot and `reserve_lease` | The reservation checks the snapshot's secret fingerprint under the store lock. If another pool rotated the credential in between, the candidate is refused (`STALE`) and another one is selected; no lease is ever granted on a superseded secret. |
-| Secret rotated back to an earlier value | Refused. The store keeps the newer generation and gives no lease to the earlier secret, so a stale or reverted source cannot reactivate a revoked credential. A deliberate rollback needs a new store; there is no in-place API for it in v0.1.0. |
+| Secret rotated back to an earlier value | Refused. The store keeps the newer generation and gives no lease to the earlier secret, so a stale or reverted source cannot reactivate a revoked credential. |
+| Secret rotated to a never-seen value | Adopted as the next generation. The lifecycle state is not changed: a `REVOKED` or `UNHEALTHY` credential stays out of rotation. |
+| Explicit recovery or rollback | `CredentialPool.authorize_secret(id)` reads the source's current secret and makes it the active generation under a new generation number, then resets the credential to `AVAILABLE`. Leases granted under any earlier generation keep their outcomes discarded. Authorization re-reads the source after updating the store and follows it if it moved, so the store never stays on a secret the source has left. |
+| Unbounded secret history | The store remembers up to 1024 adopted fingerprints per credential. Once it forgets one, it refuses unseen fingerprints in automatic synchronisation (fail closed) until `authorize_secret` is called; a forgotten secret therefore cannot be replayed in. |
+| Pool built over a source that is unreadable | Construction raises `CredentialSourceError`. The source is read once at construction to record the baseline secrets; without that baseline a secret the source briefly reverted to could be adopted as a rotation. |
+| Custom store without the generation contract | `CredentialPool` raises `ConfigurationError` at construction if the store has no `sync_credential` or its `reserve_lease` does not accept `secret_fingerprint`. |
 
 ## 4. Architecture Diagram
 

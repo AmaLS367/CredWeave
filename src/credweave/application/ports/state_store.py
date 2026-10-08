@@ -126,10 +126,28 @@ class StateStore(Protocol):
     of the registry (``reserve_lease``, ``settle_lease``, ``reclaim_expired_leases``) must be
     atomic: it either fully applies or, if it raises, leaves the store unchanged.
 
-    Secrets are versioned per credential by a store-owned *generation*. The store adopts a
-    newly seen secret fingerprint as the next generation and never re-adopts an earlier one, so
-    a stale snapshot cannot roll the credential back. Leases record the generation they were
-    granted under, and ``reserve_lease`` only grants a lease for the current generation.
+    Secrets are versioned per credential by a store-owned *generation*. This is the generation
+    contract, and a store that does not honour it is refused by ``CredentialPool`` at
+    construction. A store must provide:
+
+    - ``sync_credential(credential_id, secret_fingerprint=None, *, state, metadata)``, which
+      adopts a fingerprint the source presents. A never-adopted fingerprint becomes the next
+      generation; an already-adopted one is refused, leaving the store unchanged. Synchronisation
+      never changes lifecycle state. ``sync_credential_async`` is optional; the pool falls back
+      to the synchronous method.
+    - ``reserve_lease(..., secret_fingerprint=...)``, which returns ``STALE`` unless the
+      fingerprint is the current generation, and records the generation on the lease.
+    - ``settle_lease``, which applies no outcome for a lease from an earlier generation.
+    - ``authorize_secret(credential_id, secret_fingerprint)``, which makes the given fingerprint
+      the active one under a *new* generation number (even if it was adopted before, which is a
+      rollback) and resets the credential to ``AVAILABLE``. Only this recovers a REVOKED or
+      UNHEALTHY credential because of a secret change. It is needed only for
+      ``CredentialPool.authorize_secret``; ``authorize_secret_async`` is optional.
+
+    Generation numbers never repeat. Leases therefore stay isolated from every later generation,
+    including one that re-activates an earlier secret. A store may bound how many fingerprints it
+    remembers, but once it has forgotten one it must refuse unseen fingerprints in
+    ``sync_credential`` (fail closed) until ``authorize_secret`` is called.
 
     Fingerprints are keyed per process (see :mod:`credweave.domain._security`). A store shared
     by several processes must replace them with fingerprints keyed by a secret all of them share;

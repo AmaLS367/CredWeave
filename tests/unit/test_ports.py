@@ -2,6 +2,7 @@
 
 from collections.abc import Sequence
 from datetime import datetime, timezone
+from typing import Any
 
 from credweave.application.ports.credential_source import CredentialSource
 from credweave.application.ports.state_store import (
@@ -61,6 +62,18 @@ class MockStore:
 
     def __init__(self) -> None:
         self._records: dict[str, CredentialRecord] = {}
+
+    def sync_credential(
+        self,
+        credential_id: str,
+        secret_fingerprint: str | None = None,
+        **_: Any,
+    ) -> CredentialRecord:
+        """Register the record only: this minimal fake keeps no secret generations."""
+        return self._records.setdefault(
+            credential_id,
+            CredentialRecord(credential_id=credential_id, state=CredentialState.AVAILABLE),
+        )
 
     def get_record(self, credential_id: str) -> CredentialRecord | None:
         return self._records.get(credential_id)

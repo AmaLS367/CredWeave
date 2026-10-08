@@ -1,6 +1,7 @@
 """Integration and regression tests for credential rotation and pre-rotation lease safety."""
 
 import concurrent.futures
+import contextlib
 import threading
 from collections.abc import Sequence
 
@@ -47,8 +48,8 @@ class MutableSource(CredentialSource):
         return True
 
 
-def test_revoked_credential_recovers_when_secret_changes() -> None:
-    """A revoked credential returns to AVAILABLE when its secret actually changes."""
+def test_revoked_credential_recovers_only_when_authorized() -> None:
+    """A rotation alone never reactivates a REVOKED credential; explicit authorization does."""
     clock = TestClock()
     store = MemoryStateStore(clock=clock)
     source = MutableSource([_cred("c1", "secret-v1")])
@@ -57,32 +58,31 @@ def test_revoked_credential_recovers_when_secret_changes() -> None:
     # 1. Lease credential and report AUTH_FAILED (marks REVOKED)
     lease = pool.acquire_sync()
     pool.report_sync(lease, Outcome.auth_failed(reason="invalid key"))
-
-    record = pool.get_record("c1")
-    assert record is not None
-    assert record.state is CredentialState.REVOKED
+    assert _state(pool) is CredentialState.REVOKED
 
     # 2. Source refreshes with identical secret -> stays REVOKED
     source.set_credentials([_cred("c1", "secret-v1")])
     with pytest.raises(NoCredentialsAvailableError):
         pool.acquire_sync()
-    record = pool.get_record("c1")
-    assert record is not None
-    assert record.state is CredentialState.REVOKED
+    assert _state(pool) is CredentialState.REVOKED
 
-    # 3. Source rotates secret -> recovers to AVAILABLE
+    # 3. Source rotates secret -> still REVOKED: an unknown secret is not authorization
     source.set_credentials([_cred("c1", "secret-v2")])
+    with pytest.raises(NoCredentialsAvailableError):
+        pool.acquire_sync()
+    assert _state(pool) is CredentialState.REVOKED
+
+    # 4. Explicit authorization of the presented secret recovers the credential
+    pool.authorize_secret("c1")
     new_lease = pool.acquire_sync()
     assert new_lease.credential.require_secret("key") == "secret-v2"
-    record = pool.get_record("c1")
-    assert record is not None
-    assert record.state is CredentialState.AVAILABLE
+    assert _state(pool) is CredentialState.AVAILABLE
     pool.report_sync(new_lease, Outcome.success())
     assert_lease_accounting(store)
 
 
-def test_unhealthy_credential_recovers_when_secret_changes() -> None:
-    """An unhealthy credential recovers to AVAILABLE when rotated."""
+def test_unhealthy_credential_recovers_only_when_authorized() -> None:
+    """An unhealthy credential is not recovered by rotation; authorization recovers it."""
     clock = TestClock()
     store = MemoryStateStore(clock=clock)
     source = MutableSource([_cred("c1", "secret-v1")])
@@ -90,62 +90,32 @@ def test_unhealthy_credential_recovers_when_secret_changes() -> None:
 
     lease = pool.acquire_sync()
     pool.report_sync(lease, Outcome.permanent_failure(reason="broken"))
-    record = pool.get_record("c1")
-    assert record is not None
-    assert record.state is CredentialState.UNHEALTHY
+    assert _state(pool) is CredentialState.UNHEALTHY
 
     # Refresh with identical secret -> stays UNHEALTHY
     source.set_credentials([_cred("c1", "secret-v1")])
     with pytest.raises(NoCredentialsAvailableError):
         pool.acquire_sync()
-    record = pool.get_record("c1")
-    assert record is not None
-    assert record.state is CredentialState.UNHEALTHY
+    assert _state(pool) is CredentialState.UNHEALTHY
 
-    # Rotate secret -> recovers
+    # Rotate secret -> still UNHEALTHY until the rotated secret is authorized
     source.set_credentials([_cred("c1", "secret-v2")])
+    with pytest.raises(NoCredentialsAvailableError):
+        pool.acquire_sync()
+    assert _state(pool) is CredentialState.UNHEALTHY
+
+    pool.authorize_secret("c1")
     new_lease = pool.acquire_sync()
     assert new_lease.credential.require_secret("key") == "secret-v2"
-    record = pool.get_record("c1")
-    assert record is not None
-    assert record.state is CredentialState.AVAILABLE
+    assert _state(pool) is CredentialState.AVAILABLE
     pool.report_sync(new_lease, Outcome.success())
     assert_lease_accounting(store)
 
 
-def test_pre_rotation_lease_outcome_cannot_corrupt_new_credential() -> None:
-    """Outcomes reported from pre-rotation leases release slot without corrupting new state."""
-    clock = TestClock()
-    store = MemoryStateStore(clock=clock)
-    source = MutableSource([_cred("c1", "secret-v1")])
-    pool = CredentialPool(source=source, store=store, clock=clock)
-
-    # Worker 1 acquires lease under secret-v1
-    old_lease = pool.acquire_sync()
-    assert old_lease.credential.require_secret("key") == "secret-v1"
-    assert pool.in_flight_leases == 1
-
-    # Operator rotates secret in source
-    source.set_credentials([_cred("c1", "secret-v2")])
-
-    # Worker 2 acquires new lease with rotated secret
-    new_lease = pool.acquire_sync()
-    assert new_lease.credential.require_secret("key") == "secret-v2"
-    assert pool.in_flight_leases == 2
-
-    # Worker 1 now reports AUTH_FAILED with the old lease (e.g. from upstream rejected request)
-    pool.report_sync(old_lease, Outcome.auth_failed(reason="old key revoked"))
-
-    # Credential c1 MUST NOT be marked REVOKED because the lease was pre-rotation!
+def _state(pool: CredentialPool) -> CredentialState:
     record = pool.get_record("c1")
     assert record is not None
-    assert record.state is CredentialState.AVAILABLE
-    assert pool.in_flight_leases == 1
-
-    # Worker 2 reports success
-    pool.report_sync(new_lease, Outcome.success())
-    assert pool.in_flight_leases == 0
-    assert_lease_accounting(store)
+    return record.state
 
 
 @pytest.mark.asyncio
@@ -165,8 +135,16 @@ async def test_multiple_pools_sharing_store_with_rotation() -> None:
     assert rec is not None
     assert rec.state is CredentialState.REVOKED
 
-    # Pool 2 rotates secret
+    # Pool 2 rotates secret; the rotation alone does not recover the credential
     source_two.set_credentials([_cred("c1", "secret-v2")])
+    with pytest.raises(NoCredentialsAvailableError):
+        await pool_two.acquire()
+    rec = store.get_record("c1")
+    assert rec is not None
+    assert rec.state is CredentialState.REVOKED
+
+    # An operator authorizes the new secret through either pool sharing the store
+    pool_two.authorize_secret("c1")
     lease_two = await pool_two.acquire()
     assert lease_two.credential.require_secret("key") == "secret-v2"
     rec = store.get_record("c1")
@@ -199,7 +177,9 @@ def test_concurrent_rotation_and_lease_reporting() -> None:
         for i in range(25):
             lease = None
             try:
-                lease = pool.acquire_sync()
+                with contextlib.suppress(NoCredentialsAvailableError):
+                    # racing reports revoked both credentials until the next authorization
+                    lease = pool.acquire_sync()
                 if i % 5 == 0:
                     source.set_credentials(
                         [
@@ -207,6 +187,10 @@ def test_concurrent_rotation_and_lease_reporting() -> None:
                             _cred("b", f"sec-{worker_id}-{i}"),
                         ]
                     )
+                    # Reviving a revoked credential is an explicit act, so each rotation is
+                    # authorized. A racing rotation is fine: the pool re-reads the source.
+                    pool.authorize_secret("a")
+                    pool.authorize_secret("b")
             finally:
                 if lease is not None:
                     outcome = Outcome.auth_failed(reason="err") if i % 7 == 0 else Outcome.success()

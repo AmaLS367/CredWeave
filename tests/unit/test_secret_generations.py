@@ -38,8 +38,8 @@ def test_first_fingerprint_is_generation_one_and_stamps_leases() -> None:
     assert lease.secret_fingerprint == _fp("A")
 
 
-def test_rotation_advances_generation_and_recovers_revoked_credential() -> None:
-    """A new fingerprint is the next generation and recovers a REVOKED credential."""
+def test_rotation_advances_generation_without_recovering_revoked_credential() -> None:
+    """A new fingerprint is the next generation but never reactivates a REVOKED credential."""
     clock = TestClock()
     store = MemoryStateStore(clock=clock)
     store.sync_credential("c1", _fp("A"))
@@ -48,9 +48,126 @@ def test_rotation_advances_generation_and_recovers_revoked_credential() -> None:
     assert store.get_record("c1").state is CredentialState.REVOKED
 
     record = store.sync_credential("c1", _fp("B"))
+    assert record.state is CredentialState.REVOKED
+    assert _reserve(store, "l2", clock.now(), _fp("B")) is LeaseReservation.INELIGIBLE
+
+    store.authorize_secret("c1", _fp("B"))
+    assert _reserve(store, "l3", clock.now(), _fp("B")) is LeaseReservation.RESERVED
+    assert _lease(store, "l3").secret_generation == 2
+
+
+@pytest.mark.parametrize(
+    "state",
+    [CredentialState.AVAILABLE, CredentialState.REVOKED, CredentialState.UNHEALTHY],
+)
+def test_unseen_fingerprint_never_changes_lifecycle_state(state: CredentialState) -> None:
+    """Synchronisation adopts an unseen secret but leaves state, failures and cooldown alone."""
+    clock = TestClock()
+    store = MemoryStateStore(clock=clock)
+    store.sync_credential("c1", _fp("A"))
+    cooldown_until = clock.now() + timedelta(seconds=30)
+    store.update_state("c1", state, cooldown_until=cooldown_until)
+    before = store.get_record("c1")
+
+    after = store.sync_credential("c1", _fp("B"))
+    assert after.state is before.state
+    assert after.consecutive_failures == before.consecutive_failures
+    assert after.cooldown_until == before.cooldown_until
+
+
+def test_authorize_recovers_revoked_credential_under_current_secret_without_new_generation() -> (
+    None
+):
+    """Authorizing the secret already active resets the state but keeps the generation."""
+    clock = TestClock()
+    store = MemoryStateStore(clock=clock)
+    store.sync_credential("c1", _fp("A"))
+    store.update_state("c1", CredentialState.REVOKED)
+
+    record = store.authorize_secret("c1", _fp("A"))
     assert record.state is CredentialState.AVAILABLE
-    assert _reserve(store, "l2", clock.now(), _fp("B")) is LeaseReservation.RESERVED
-    assert _lease(store, "l2").secret_generation == 2
+    assert _reserve(store, "l1", clock.now(), _fp("A")) is LeaseReservation.RESERVED
+    assert _lease(store, "l1").secret_generation == 1
+
+
+def test_authorize_rolls_back_to_earlier_secret_under_a_new_generation() -> None:
+    """Rollback re-activates A, but leases granted under A's first generation stay isolated."""
+    clock = TestClock()
+    store = MemoryStateStore(clock=clock)
+    store.sync_credential("c1", _fp("A"))
+    _reserve(store, "old_a", clock.now(), _fp("A"))
+    store.sync_credential("c1", _fp("B"))
+    _reserve(store, "b", clock.now(), _fp("B"))
+    store.settle_lease("b", "c1", Outcome.auth_failed(reason="B revoked"), clock.now())
+    assert store.get_record("c1").state is CredentialState.REVOKED
+
+    store.authorize_secret("c1", _fp("A"))
+    assert store.get_record("c1").state is CredentialState.AVAILABLE
+    assert _reserve(store, "a2", clock.now(), _fp("A")) is LeaseReservation.RESERVED
+    assert _lease(store, "a2").secret_generation == 3
+    assert _reserve(store, "stale_b", clock.now(), _fp("B")) is LeaseReservation.STALE
+
+    settlement = store.settle_lease(
+        "old_a", "c1", Outcome.permanent_failure(reason="old A"), clock.now()
+    )
+    assert settlement is LeaseSettlement.SETTLED
+    assert store.get_record("c1").state is CredentialState.AVAILABLE
+    assert store.get_record("c1").consecutive_failures == 0
+    assert_lease_accounting(store)
+
+
+def test_authorize_keeps_in_flight_counters_and_clears_failures_and_cooldown() -> None:
+    """Authorization resets health but must not lose the slots of leases still in flight."""
+    clock = TestClock()
+    store = MemoryStateStore(clock=clock)
+    store.sync_credential("c1", _fp("A"))
+    _reserve(store, "l1", clock.now(), _fp("A"))
+    store.update_state("c1", CredentialState.UNHEALTHY)
+
+    record = store.authorize_secret("c1", _fp("A"))
+    assert record.in_flight_leases == 1
+    assert record.total_leases == 1
+    assert record.cooldown_until is None
+    assert_lease_accounting(store)
+
+
+def test_history_is_bounded_and_truncation_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A forgotten secret cannot be replayed by sync; explicit authorization still works."""
+    monkeypatch.setattr(MemoryStateStore, "_SECRET_HISTORY_LIMIT", 2)
+    clock = TestClock()
+    store = MemoryStateStore(clock=clock)
+    store.sync_credential("c1", _fp("A"))
+    store.sync_credential("c1", _fp("B"))
+    store.sync_credential("c1", _fp("C"))  # evicts A; history is now truncated
+
+    replay = store.sync_credential("c1", _fp("A"))
+    assert replay.state is CredentialState.AVAILABLE
+    assert _reserve(store, "replay", clock.now(), _fp("A")) is LeaseReservation.STALE
+
+    store.sync_credential("c1", _fp("D"))  # unseen, but truncated: refused, not adopted
+    assert _reserve(store, "d", clock.now(), _fp("D")) is LeaseReservation.STALE
+    assert _reserve(store, "c", clock.now(), _fp("C")) is LeaseReservation.RESERVED
+    assert _lease(store, "c").secret_generation == 3
+
+    store.authorize_secret("c1", _fp("D"))
+    assert _reserve(store, "d2", clock.now(), _fp("D")) is LeaseReservation.RESERVED
+    assert _lease(store, "d2").secret_generation == 4
+
+
+def test_adopted_history_stays_within_the_limit_under_many_rotations() -> None:
+    """Memory per credential is bounded: once truncated, further unseen rotations are refused."""
+    limit = MemoryStateStore._SECRET_HISTORY_LIMIT
+    store = MemoryStateStore(clock=TestClock())
+    for n in range(3 * limit):
+        store.sync_credential("c1", _fp(f"secret-{n}"))
+
+    generations = store._secret_generations["c1"]
+    assert len(generations.adopted) == limit
+    assert generations.truncated is True
+    # Generations 1..limit fill the history; generation limit+1 forgets the oldest and truncates.
+    # Every later unseen secret is refused, so the generation stops growing.
+    assert generations.generation == limit + 1
+    assert _fp(f"secret-{3 * limit - 1}") not in generations.adopted
 
 
 def test_superseded_fingerprint_is_refused_and_changes_nothing() -> None:

@@ -192,7 +192,7 @@ A credential at its cap is skipped (its health is untouched) until a slot frees 
 
 ## 🔌 Credential Sources
 
-Besides in-memory credentials (`StaticSource`), a pool can load credentials from the environment or a JSON file and **pick up rotations while running**, with no pool recreation and no background thread. Sources are re-read on every acquire; state (usage, cooldowns, health) stays attached to the stable credential `id`. A secret that was rotated away from is never re-adopted: a pool still holding an older snapshot gets no leases from it, so it cannot undo a rotation or revive a revoked credential.
+Besides in-memory credentials (`StaticSource`), a pool can load credentials from the environment or a JSON file and **pick up rotations while running**, with no pool recreation and no background thread. Sources are re-read on every acquire; state (usage, cooldowns, health) stays attached to the stable credential `id`. A secret that was rotated away from is never re-adopted: a pool still holding an older snapshot gets no leases from it, so it cannot undo a rotation. A rotation never changes a credential's health: a `REVOKED` or `UNHEALTHY` credential stays out of rotation until you call `pool.authorize_secret(credential_id)` (after repairing the secret in the source), or `pool.reset_credential(credential_id)` to clear its state without a secret check. `authorize_secret` is also how you roll back: restore the earlier secret in the source, then authorize it.
 
 ### `EnvSource`: credentials from environment variables
 
@@ -244,7 +244,7 @@ print(source.reload_status)  # generation, last_error, consecutive_failures
 ```
 
 - **Strict schema:** top-level `credentials` list; each entry has a unique non-empty `id`, a non-empty `secrets` object of strings, and an optional `metadata` object. Unknown fields, duplicate keys, wrong types and `NaN` are rejected, with secret-safe messages that never echo file content.
-- **Rotation:** replace the file (ideally atomically: write a temp file, then `os.replace`). A changed secret under the same `id` is used by future leases, while the credential's history and cooldown are preserved. Added credentials are eligible immediately; removed ones receive no new leases, and their active leases can still be reported.
+- **Rotation:** replace the file (ideally atomically: write a temp file, then `os.replace`). A changed secret under the same `id` is used by future leases, while the credential's history and cooldown are preserved. Added credentials are eligible immediately; removed ones receive no new leases, and their active leases can still be reported. The pool reads the source once when it is constructed, so a source that cannot be read then raises `CredentialSourceError` instead of starting with an unknown baseline.
 - **Last known good:** if the file turns malformed, the previous credentials keep being served and `source.reload_status` / `source.refresh()` report the error. Only the initial load raises.
 - **Cost:** one `stat` per read (tune with `JsonSource(path, min_check_interval=1.0)`). The async API runs file work off the event loop.
 
