@@ -8,13 +8,13 @@ CredWeave is a provider-agnostic, protocol-independent credential lifecycle engi
 
 ## 🧭 Table of Contents
 
-- [Code of Conduct & Philosophy](#-code-of-conduct--philosophy)
-- [Development Setup](#-development-setup)
-- [Running Quality Checks](#-running-quality-checks)
-- [Architectural Invariants](#-architectural-invariants)
-- [Security Guidelines](#-security-guidelines)
-- [Pull Request Process](#-pull-request-process)
-- [Releases](#-releases)
+- [Code of Conduct & Philosophy](#code-of-conduct--philosophy)
+- [Development Setup](#development-setup)
+- [Running Quality Checks](#running-quality-checks)
+- [Architectural Invariants](#architectural-invariants)
+- [Security Guidelines](#security-guidelines)
+- [Pull Request Process](#pull-request-process)
+- [Releases](#releases)
 
 ---
 

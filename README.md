@@ -1,6 +1,6 @@
-# 🧵 CredWeave
-
 <div align="center">
+
+# 🧵 CredWeave
 
 **Provider-agnostic credential pooling, intelligent scheduling, rate-limit cooldown, and automatic failover for Python.**
 
@@ -9,16 +9,19 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
 [![Checked with mypy](https://img.shields.io/badge/mypy-strict-blue.svg)](https://mypy-lang.org/)
-[![Dependencies: Zero](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](pyproject.toml)
+[![Dependencies](https://img.shields.io/badge/dependencies-0%20(stdlib)-brightgreen.svg)](pyproject.toml)
 
-[Key Features](#-key-features) •
-[Why CredWeave?](#-why-credweave) •
-[Design Philosophy](#-core-design-philosophy) •
-[Quickstart](#-quickstart) •
-[Architecture](#️-clean-architecture) •
-[Security](#️-security--defense-in-depth-guarantees) •
-[Roadmap](docs/ROADMAP.md) •
-[Contributing](docs/CONTRIBUTING.md)
+<p align="center">
+  <a href="#why-credweave">Why CredWeave?</a> •
+  <a href="#key-features">Key Features</a> •
+  <a href="#core-design-philosophy">Design Philosophy</a> •
+  <a href="#quickstart">Quickstart</a> •
+  <a href="#the-lease-lifecycle">Lease Lifecycle</a> •
+  <a href="#scheduling-strategies">Strategies</a> •
+  <a href="#credential-sources">Sources</a> •
+  <a href="#security-guarantees">Security</a> •
+  <a href="#clean-architecture">Architecture</a>
+</p>
 
 </div>
 
@@ -26,15 +29,15 @@
 
 ## 📌 Why CredWeave?
 
-Production applications communicating with external services—such as LLM APIs, cloud providers, and third-party SaaS—often start with a single API key in an `.env` file. 
+Production applications communicating with external services—such as LLM APIs, cloud providers, and third-party SaaS—often start with a single API key in an `.env` file.
 
 As workload scale increases, systems quickly outgrow single-credential architectures:
 
-* 🏢 **Multiple Accounts & Tenants:** Distributing load across organization tiers, departments, or multiple provider accounts.
-* ⏱️ **Rate-Limit Throttling:** Encountering `429 Too Many Requests` spikes requiring automated cooldown windows and upstream `Retry-After` adherence.
-* 🔀 **Failover & High Availability:** Automatically routing around revoked tokens, depleted credit quotas, or regional outages without downtime.
-* 🔄 **Dynamic Scheduling:** Balancing requests fairly using Round-Robin, Weighted distribution, or Least-Recently-Used heuristics.
-* 🔒 **Security Risks:** Secret values accidentally leaking into APM traces, exception tracebacks, or console logs.
+- 🏢 **Multiple Accounts & Tenants:** Distributing load across organization tiers, departments, or multiple provider accounts.
+- ⏱️ **Rate-Limit Throttling:** Handling `429 Too Many Requests` spikes requiring automated cooldown windows and upstream `Retry-After` adherence.
+- 🔀 **Failover & High Availability:** Automatically routing around revoked tokens, depleted credit quotas, or regional outages without downtime.
+- 🔄 **Dynamic Scheduling:** Balancing requests fairly using Round-Robin, Weighted distribution, or Least-Recently-Used heuristics.
+- 🔒 **Security Risks:** Secret values accidentally leaking into APM traces, exception tracebacks, or console logs.
 
 Most teams end up hand-crafting fragile, ad-hoc rotation loops tightly coupled to a specific HTTP client (`httpx`, `requests`) or provider SDK (`openai`, `anthropic`).
 
@@ -50,8 +53,8 @@ Most teams end up hand-crafting fragile, ad-hoc rotation loops tightly coupled t
 | 🔌 **Protocol & Client Agnostic** | Works seamlessly with **any** HTTP client, gRPC client, or provider SDK (`httpx`, `aiohttp`, `requests`, OpenAI, etc.). |
 | ⏳ **Intelligent Cooldowns** | Automatically isolates rate-limited keys with fixed durations or exponential backoff, respecting upstream `retry_after`. |
 | 🔀 **Resilient Failover** | Seamlessly pivots to secondary/backup credential tiers when primary quotas are exhausted or credentials fail. |
-| 🔄 **Pluggable Scheduling** | Round-robin, weighted allocation, least-recently-used, and custom selection strategies. |
-| 📊 **Outcome-Driven Lifecycle** | Simple lease model where clients report outcomes (`success`, `rate_limited`, `auth_failed`, `transient_error`). |
+| 🔄 **Pluggable Scheduling** | Round-robin, weighted allocation, least-recently-used, least-used, failover, and randomized strategies. |
+| 📊 **Outcome-Driven Lifecycle** | Simple lease model where clients report execution outcomes (`success`, `rate_limited`, `auth_failed`, `transient_error`). |
 | 🪶 **Zero Dependencies** | Built strictly on the Python standard library. Hyper-lightweight and blisteringly fast. |
 | 🏗️ **Clean Architecture** | Strict inward dependency rule: pure Domain models, well-defined Application ports, and pluggable Infrastructure. |
 
@@ -59,9 +62,10 @@ Most teams end up hand-crafting fragile, ad-hoc rotation loops tightly coupled t
 
 ## 💡 Core Design Philosophy
 
-> 🔑 **CredWeave manages credentials and their lifecycle. It does not perform network requests itself.**
+> [!IMPORTANT]
+> **CredWeave manages credentials and their lifecycle. It does not perform network requests itself.**
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────┐
 │                      Your Application / Task                    │
 │                                                                 │
@@ -91,7 +95,7 @@ pip install credweave
 
 *(Currently in active development: install from source or editable mode via `pip install -e .`)*
 
-### 2. Basic Usage
+### 2. Asynchronous Usage
 
 Define credentials, initialize a pool, acquire a lease, and report the execution outcome:
 
@@ -119,32 +123,55 @@ pool = CredentialPool(credentials=credentials)
 
 # 3. Acquire a lease, execute your request, and report the outcome
 async def dispatch_request() -> None:
-    # Acquire the optimal eligible credential:
+    # Acquire the optimal eligible credential
     lease = await pool.acquire()
 
     try:
-        # Retrieve secret for network execution
+        # Retrieve the secret for network execution
         api_key = lease.credential.get_secret("api_key")
 
-        # >>> Execute with your preferred client (e.g. httpx, openai, etc.) <<<
+        # >>> Execute with your preferred client (httpx, openai, etc.) <<<
         # response = await openai_client.chat.completions.create(...)
 
-        # Report successful completion:
+        # Report successful completion
         await pool.report(lease, Outcome.success())
 
-    except RateLimitException as exc:
-        # Credential is automatically put in cooldown; upstream retry_after respected:
-        await pool.report(
-            lease,
-            Outcome.rate_limited(retry_after=exc.retry_after, reason=str(exc)),
-        )
+    except Exception as exc:
+        # Check for rate-limiting (e.g. HTTP 429)
+        if getattr(exc, "status_code", None) == 429:
+            retry_after = getattr(exc, "retry_after", 30.0)
+            await pool.report(
+                lease,
+                Outcome.rate_limited(retry_after=retry_after, reason=str(exc)),
+            )
+        # Check for authentication or revocation errors (e.g. HTTP 401/403)
+        elif getattr(exc, "status_code", None) in (401, 403):
+            await pool.report(
+                lease,
+                Outcome.auth_failed(reason="Invalid API Key or Revoked Token"),
+            )
+        else:
+            # Report transient error with exponential backoff
+            await pool.report(
+                lease,
+                Outcome.transient_error(reason=str(exc)),
+            )
+```
 
-    except AuthenticationException as exc:
-        # Permanently isolate compromised or revoked credentials:
-        await pool.report(
-            lease,
-            Outcome.auth_failed(reason="Invalid API Key or Revoked Token"),
-        )
+### 3. Synchronous Usage
+
+CredWeave provides identical synchronous ergonomics for blocking scripts and worker pools:
+
+```python
+# Acquire a lease synchronously
+lease = pool.acquire_sync()
+
+try:
+    api_key = lease.credential.get_secret("api_key")
+    # ... execute request ...
+    pool.report_sync(lease, Outcome.success())
+except Exception as exc:
+    pool.report_sync(lease, Outcome.transient_error(reason=str(exc)))
 ```
 
 ---
@@ -157,7 +184,7 @@ CredWeave uses a formal **Lease** pattern to ensure atomic handling, state track
 stateDiagram-v2
     [*] --> AVAILABLE: Registered in Pool
     AVAILABLE --> LEASED: pool.acquire()
-    
+
     LEASED --> AVAILABLE: Outcome.success()
     LEASED --> RATE_LIMITED: Outcome.rate_limited()
     LEASED --> COOLDOWN: Outcome.transient_error()
@@ -175,30 +202,69 @@ stateDiagram-v2
 3. **Report:** The client returns the `Lease` along with a standardized `Outcome` (`success`, `rate_limited`, `auth_failed`, `transient_error`).
 4. **Transition:** The state store updates credential state, adjusts backoff timers, or escalates health flags.
 
-### Concurrency caps and lease timeouts
+### Concurrency Caps & Lease Timeouts
+
+CredWeave provides built-in concurrency gating and automatic lease reclamation:
 
 ```python
 pool = CredentialPool(
-    [
+    credentials=[
         Credential("primary", secrets={"api_key": "..."}, metadata={"max_concurrency": 2}),
         Credential("backup", secrets={"api_key": "..."}),
     ],
-    max_concurrency_per_credential=5,  # default cap; None (the default) means unlimited
-    lease_timeout=60.0,  # unreported leases are reclaimed after 60 s
+    max_concurrency_per_credential=5,  # Default pool-wide cap (None = unlimited)
+    lease_timeout=60.0,  # Unreported leases reclaimed after 60s
 )
 ```
 
-A credential at its cap is skipped (its health is untouched) until a slot frees up, and the cap is enforced atomically in the state store, so it holds across threads, asyncio tasks and pools sharing one store. Leases that are never reported are reclaimed automatically on the next `acquire`/`report`, or on demand with `pool.reclaim_expired_leases()`; a late `report` of a reclaimed lease raises `LeaseExpiredError`.
+- **Atomic Concurrency Caps:** Limits in-flight leases per credential. A credential at capacity is skipped until an active lease is reported or reclaimed, without degrading credential health. Concurrency is enforced atomically across threads and async tasks.
+- **Automatic Lease Reclamation:** If a worker crashes or fails to report a lease, the slot is automatically reclaimed on subsequent `acquire()` / `report()` calls, or explicitly via `pool.reclaim_expired_leases()`.
+- **Expired Lease Protection:** Reporting an expired lease safely raises `LeaseExpiredError` rather than corrupting pool metrics.
+
+---
+
+## ⚖️ Scheduling Strategies
+
+CredWeave includes six production-ready selection strategies:
+
+| Strategy | Description | Best For |
+| :--- | :--- | :--- |
+| `RoundRobinStrategy` *(default)* | Cycles through eligible credentials evenly. | Balanced traffic, identical tier keys |
+| `WeightedStrategy` | Distributes leases proportionally to credential weights. | Unequal quotas or account tiers |
+| `LeastRecentlyUsedStrategy` (LRU) | Selects the credential that has been idle the longest. | Maximizing recovery time between requests |
+| `LeastUsedStrategy` | Prioritizes credentials with the lowest cumulative lease count. | Even quota consumption over time |
+| `FailoverStrategy` | Strict priority fallback groups; uses secondary tiers only when primary is unavailable. | High-availability active/passive setups |
+| `RandomStrategy` | Uniform or weighted random selection. | High-throughput stateless distribution |
+
+### Configuring a Strategy
+
+```python
+from credweave import Credential, CredentialPool, WeightedStrategy
+
+credentials = [
+    Credential("tier-high", secrets={"api_key": "key-1"}, metadata={"weight": 10}),
+    Credential("tier-low", secrets={"api_key": "key-2"}, metadata={"weight": 1}),
+]
+
+pool = CredentialPool(credentials=credentials, strategy=WeightedStrategy())
+```
 
 ---
 
 ## 🔌 Credential Sources
 
-Besides in-memory credentials (`StaticSource`), a pool can load credentials from the environment or a JSON file and **pick up rotations while running**, with no pool recreation and no background thread. Sources are re-read on every acquire; state (usage, cooldowns, health) stays attached to the stable credential `id`. A secret that was rotated away from is never re-adopted: a pool still holding an older snapshot gets no leases from it, so it cannot undo a rotation. A never-seen secret is adopted as a rotation only by a pool that is advancing from the secret it last saw. CredWeave has no trustworthy source revisions, so it cannot tell a newer unseen secret from an older one. A pool built over a store that already holds a different secret, or whose last observation was superseded, therefore gets no leases from its unseen secret until you call `pool.authorize_secret(credential_id)`; until then its acquires raise `NoCredentialsAvailableError`. A rotation never changes a credential's health: a `REVOKED` or `UNHEALTHY` credential stays out of rotation until you call `pool.authorize_secret(credential_id)` (after repairing the secret in the source), or `pool.reset_credential(credential_id)` to clear its state without a secret check. `authorize_secret` is also how you roll back: restore the earlier secret in the source, then authorize it.
+Besides in-memory credentials (`StaticSource`), CredWeave can load credentials dynamically from environment variables or structured files, **hot-reloading rotations during runtime** without pool re-instantiation and without background threads.
 
-### `EnvSource`: credentials from environment variables
+### Hot Reload & Rotation Invariants
 
-Configure **variable names**, never secret values:
+- **Dynamic Hot Reload:** File fingerprints and environment variables are re-evaluated on every `acquire()`. State (usage counts, cooldowns, health) remains bound to the stable credential `id`.
+- **Anti-Rollback Protection:** A rotated-away secret is never accidentally re-adopted by an older snapshot.
+- **Explicit Authorization:** When a pool connects to a state store with a pre-existing secret, or when an unknown secret appears, CredWeave requires `pool.authorize_secret(credential_id)` to prevent race conditions.
+- **Health Preservation:** Rotation never overrides health flags. A `REVOKED` or `UNHEALTHY` credential stays blocked until repaired and authorized via `pool.authorize_secret(credential_id)` or cleared with `pool.reset_credential(credential_id)`.
+
+### `EnvSource`: Credentials from Environment Variables
+
+Configure **variable names**, never raw secret values:
 
 ```python
 from credweave import CredentialPool, EnvCredential, EnvSource
@@ -207,29 +273,39 @@ source = EnvSource(
     [
         EnvCredential(
             id="openai-primary",
-            secrets={"api_key": "OPENAI_API_KEY_PRIMARY"},  # secret field -> env var name
-            optional_secrets={"org_id": "OPENAI_ORG_PRIMARY"},  # omitted when unset
+            secrets={"api_key": "OPENAI_API_KEY_PRIMARY"},  # Secret field -> Env var name
+            optional_secrets={"org_id": "OPENAI_ORG_PRIMARY"},  # Omitted when unset
             metadata={"tier": "primary", "max_concurrency": 4},
         ),
-        EnvCredential(id="openai-backup", secrets={"api_key": "OPENAI_API_KEY_BACKUP"}),
+        EnvCredential(
+            id="openai-backup",
+            secrets={"api_key": "OPENAI_API_KEY_BACKUP"},
+        ),
     ]
 )
+
 pool = CredentialPool(source=source)
 ```
 
-A required variable that is unset or empty raises `CredentialSourceError` (naming the variable, never a value). Pass `environ={...}` to read from an injected mapping instead of `os.environ`, e.g. in tests.
+> [!TIP]
+> A missing required variable raises a secret-safe `CredentialSourceError` naming the variable (never the secret value). Pass `environ={...}` to inject custom mappings during testing.
 
-### `JsonSource`: credentials from a JSON file
+### `JsonSource`: Credentials from a JSON File
+
+Load and hot-reload credentials from a structured JSON document:
 
 ```json
 {
   "credentials": [
     {
       "id": "primary",
-      "secrets": {"api_key": "<your-api-key>"},
+      "secrets": {"api_key": "sk-primary-prod-key"},
       "metadata": {"tier": "primary", "max_concurrency": 2}
     },
-    {"id": "backup", "secrets": {"api_key": "<your-backup-api-key>"}}
+    {
+      "id": "backup",
+      "secrets": {"api_key": "sk-backup-prod-key"}
+    }
   ]
 }
 ```
@@ -237,26 +313,30 @@ A required variable that is unset or empty raises `CredentialSourceError` (namin
 ```python
 from credweave import CredentialPool, JsonSource
 
-source = JsonSource("credentials.json")  # raises CredentialSourceError if invalid
+source = JsonSource("credentials.json")
 pool = CredentialPool(source=source)
 
-lease = pool.acquire_sync()  # always sees the newest valid file contents
-...
-print(source.reload_status)  # generation, last_error, consecutive_failures
+# Leases always see the latest valid file state:
+lease = pool.acquire_sync()
+
+# Inspect reload diagnostics:
+print(source.reload_status)  # ReloadStatus(generation=1, last_error=None, consecutive_failures=0)
 ```
 
-- **Strict schema:** top-level `credentials` list; each entry has a unique non-empty `id`, a non-empty `secrets` object of strings, and an optional `metadata` object. Unknown fields, duplicate keys, wrong types and `NaN` are rejected, with secret-safe messages that never echo file content.
-- **Rotation:** replace the file (ideally atomically: write a temp file, then `os.replace`). A changed secret under the same `id` is used by future leases, while the credential's history and cooldown are preserved. Added credentials are eligible immediately; removed ones receive no new leases, and their active leases can still be reported. The pool reads the source once when it is constructed, so a source that cannot be read then raises `CredentialSourceError` instead of starting with an unknown baseline.
-- **Last known good:** if the file turns malformed, the previous credentials keep being served and `source.reload_status` / `source.refresh()` report the error. Only the initial load raises.
-- **Cost:** one `stat` per read (tune with `JsonSource(path, min_check_interval=1.0)`). The async API runs file work off the event loop.
+#### Key Guarantees:
+- **Strict Validation:** Requires a top-level `credentials` list with unique IDs and string secrets. Unknown fields, duplicate keys, wrong types, and `NaN` are strictly rejected without echoing file content.
+- **Atomic Rotation:** Update credentials by replacing the file (e.g. write to a temp file and `os.replace`). New credentials enter rotation immediately; removed credentials receive no new leases.
+- **Last Known Good:** If the file becomes malformed or temporarily unreadable, CredWeave continues serving previous valid credentials while logging the error in `source.reload_status`.
+- **Zero Overhead:** Fingerprint checked via a single lightweight `stat` call per read (tunable via `min_check_interval=1.0`). In async mode, file I/O runs off the event loop.
 
-> `YamlSource` is not available yet: it needs a YAML parser, which the zero-dependency standard library does not provide.
+> [!NOTE]
+> `YamlSource` is planned for a future release when an optional parser dependency or standard library parser is supported.
 
 ---
 
-## 🛡️ Security & Defense-in-Depth Guarantees
+## 🛡️ Security Guarantees
 
-Handling API keys, bearer tokens, and secrets requires strict security invariants and defense-in-depth:
+Handling API keys, bearer tokens, and credentials requires strict security invariants and defense-in-depth:
 
 ### 1. Automatic Secret Masking
 Secret dictionary keys are visible for debugging, but secret values are masked as `'***'` in all representations (`__repr__`, `__str__`):
@@ -288,20 +368,28 @@ All credential dictionaries, views, and nested metadata structures are deeply fr
 
 CredWeave is engineered strictly following Clean Architecture principles:
 
-```
+```text
 src/credweave/
 ├── domain/                  # Pure enterprise entities & domain rules
 │   ├── models.py            # Credential, Lease (Immutable data structures)
 │   ├── outcomes.py          # Outcome & OutcomeType
 │   ├── enums.py             # CredentialState, OutcomeType
+│   ├── backoff.py           # Backoff policies & jitter algorithms
 │   └── errors.py            # CredWeave domain exception hierarchy
 ├── application/             # Use cases & port protocols
 │   ├── ports/               # Clock, CredentialSource, SelectionStrategy, StateStore
-│   └── services/            # CredentialPool orchestration
+│   └── services/            # CredentialPool orchestration & LifecycleEngine
 ├── infrastructure/          # Adapters implementing application ports
 │   ├── clocks/              # SystemClock (real-time execution)
 │   ├── sources/             # StaticSource, EnvSource, JsonSource, FileReloader
-│   └── stores/              # MemoryStateStore
+│   └── stores/              # MemoryStateStore (thread-safe, asyncio-safe)
+├── strategies/              # Pluggable scheduling algorithms
+│   ├── round_robin.py       # RoundRobinStrategy
+│   ├── weighted.py          # WeightedStrategy
+│   ├── lru.py               # LeastRecentlyUsedStrategy
+│   ├── least_used.py        # LeastUsedStrategy
+│   ├── failover.py          # FailoverStrategy
+│   └── random_strategy.py   # RandomStrategy
 └── __init__.py              # Curated, strictly-typed public API exports
 ```
 
