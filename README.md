@@ -159,13 +159,15 @@ stateDiagram-v2
     AVAILABLE --> LEASED: pool.acquire()
     
     LEASED --> AVAILABLE: Outcome.success()
-    LEASED --> COOLDOWN: Outcome.rate_limited()
+    LEASED --> RATE_LIMITED: Outcome.rate_limited()
+    LEASED --> COOLDOWN: Outcome.transient_error()
     LEASED --> REVOKED: Outcome.auth_failed()
     LEASED --> UNHEALTHY: Outcome.consecutive_failures_exceeded()
-    
-    COOLDOWN --> AVAILABLE: Cooldown Expired / Probe Passed
-    UNHEALTHY --> AVAILABLE: Manual Reset / Probe Recovery
-    REVOKED --> [*]
+
+    RATE_LIMITED --> AVAILABLE: retry_after elapsed
+    COOLDOWN --> AVAILABLE: cooldown elapsed
+    UNHEALTHY --> AVAILABLE: authorize_secret() / reset_credential()
+    REVOKED --> AVAILABLE: authorize_secret() after repairing the secret
 ```
 
 1. **Acquire:** The pool evaluates eligible credentials using the configured `SelectionStrategy` and yields an active `Lease`.
