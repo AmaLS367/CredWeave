@@ -55,6 +55,12 @@ _default_source_factory: SourceFactory | None = None
 _default_store_factory: StoreFactory | None = None
 
 
+def _accepts_argument(method: Callable[..., Any], name: str) -> bool:
+    """Whether ``method`` takes ``name`` as a parameter or through ``**kwargs``."""
+    parameters = inspect.signature(method).parameters.values()
+    return any(p.name == name or p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters)
+
+
 def register_default_adapters(
     *,
     clock_factory: ClockFactory | None = None,
@@ -111,10 +117,21 @@ class CredentialPool:
         :class:`LifecycleEngine`.
 
         Construction reads the source once, to record the secrets it presents as the baseline
-        for rotation safety; a source error is raised, not deferred. A rotation never recovers a
-        ``REVOKED`` or ``UNHEALTHY`` credential: call :meth:`authorize_secret` once the secret is
-        repaired. A custom ``store`` must implement the secret-generation contract documented on
+        for rotation safety; a source error is raised, not deferred. A secret the store has not
+        seen is adopted as a rotation only by a pool advancing from the secret it last observed.
+        A pool built over a store that already holds another secret, or whose last observation
+        was superseded, cannot advance it: call :meth:`authorize_secret` to adopt the source's
+        secret explicitly. Without trustworthy source revisions, a newer secret is never told
+        apart from an older one that was never seen. A rotation never recovers a ``REVOKED`` or
+        ``UNHEALTHY`` credential: call :meth:`authorize_secret` once the secret is repaired. A
+        custom ``store`` must implement the secret-generation contract documented on
         :class:`~credweave.application.ports.state_store.StateStore`, or construction fails.
+
+        Every change of secret generation made through a pool (acquisition, authorization) is
+        committed under the pool lock, and only from a source read that no other generation
+        change overtook. Synchronous and asynchronous calls on one pool, from any thread or task,
+        therefore cannot invalidate each other's generation guarantees. The source itself may
+        still change at any instant; a generation always reflects a read taken under the lock.
 
         Lease slots live in the state store, so concurrency caps and lease reclamation hold across
         every pool, thread and asyncio task sharing one store. Expired leases are reclaimed
@@ -219,6 +236,11 @@ class CredentialPool:
             weakref.WeakValueDictionary()
         )
         self._async_lock: asyncio.Lock | None = None
+        self._observed: dict[str, str] = {}
+        """The secret fingerprint this pool last presented to the store, per credential id."""
+        self._generation_epoch = 0
+        """Bumped by every generation change this pool commits. An asynchronous read taken before
+        a bump is not trusted and is read again. Guarded by ``_pool_lock``."""
 
         # Pre-initialize store records for initial credentials
         for cred in self._initial_credentials:
@@ -238,14 +260,12 @@ class CredentialPool:
         lose stale-snapshot and rollback protection.
         """
         missing: list[str] = []
-        if getattr(self._store, "sync_credential", None) is None:
+        sync = getattr(self._store, "sync_credential", None)
+        if sync is None:
             missing.append("sync_credential()")
-        parameters = inspect.signature(self._store.reserve_lease).parameters.values()
-        accepts_fingerprint = any(
-            p.name == "secret_fingerprint" or p.kind is inspect.Parameter.VAR_KEYWORD
-            for p in parameters
-        )
-        if not accepts_fingerprint:
+        elif not _accepts_argument(sync, "last_observed"):
+            missing.append("a last_observed argument on sync_credential()")
+        if not _accepts_argument(self._store.reserve_lease, "secret_fingerprint"):
             missing.append("a secret_fingerprint argument on reserve_lease()")
         if missing:
             raise ConfigurationError(
@@ -261,9 +281,27 @@ class CredentialPool:
         as a rotation when the source reverts to it. Errors propagate: a pool whose baseline
         cannot be established is not built, so no error is silently deferred.
         """
+        with self._pool_lock:
+            for cred in self._source.get_credentials():
+                self._observe_locked(cred)
+
+    def _observe_locked(self, credential: Credential) -> CredentialRecord:
+        """Synchronise the secret a source presents, as this pool's next observation.
+
+        The store adopts an unseen secret only when this pool advances from the secret it last
+        observed (see :meth:`StateStore.sync_credential`). Lock must be held.
+        """
         sync = self._store_method("sync_credential")
-        for cred in self._source.get_credentials():
-            sync(cred.id, secret_fingerprint=cred.secret_fingerprint)
+        previous = self._observed.get(credential.id)
+        if previous != credential.secret_fingerprint:
+            self._generation_epoch += 1
+        record: CredentialRecord = sync(
+            credential.id,
+            secret_fingerprint=credential.secret_fingerprint,
+            last_observed=previous,
+        )
+        self._observed[credential.id] = credential.secret_fingerprint
+        return record
 
     def _source_fingerprint(self, credential_id: str) -> str:
         """Return the secret fingerprint the source presents for ``credential_id`` now."""
@@ -296,13 +334,12 @@ class CredentialPool:
             CredentialNotFoundError: The source does not present ``credential_id``.
             CredentialSourceError: The source cannot be read, or it kept changing throughout.
         """
-        authorize = self._store_method("authorize_secret")
-        # Held like acquire's selection, so a concurrent acquire of this pool cannot read and
-        # synchronise a secret in between the read and the adoption made here.
+        # Held like acquire's selection, so no acquire of this pool can read and synchronise a
+        # secret between the read and the adoption made here.
         with self._pool_lock:
             fingerprint = self._source_fingerprint(credential_id)
             for _ in range(self._AUTHORIZE_ATTEMPTS):
-                record: CredentialRecord = authorize(credential_id, fingerprint)
+                record = self._authorize_locked(credential_id, fingerprint)
                 latest = self._source_fingerprint(credential_id)
                 if latest == fingerprint:
                     return record
@@ -312,24 +349,33 @@ class CredentialPool:
         )
 
     async def authorize_secret_async(self, credential_id: str) -> CredentialRecord:
-        """Asynchronous equivalent of :meth:`authorize_secret`."""
-        authorize_async = getattr(self._store, "authorize_secret_async", None)
-        authorize = self._store_method("authorize_secret")
-        async with self._get_async_lock():  # as in acquire(): no interleaving within this pool
-            fingerprint = await self._source_fingerprint_async(credential_id)
+        """Asynchronous equivalent of :meth:`authorize_secret`.
+
+        The source is read without holding the pool lock, so the read is committed only if no
+        generation change overtook it while it was pending; otherwise it is read again.
+        """
+        async with self._get_async_lock():
             for _ in range(self._AUTHORIZE_ATTEMPTS):
-                record: CredentialRecord
-                if authorize_async is not None:
-                    record = await authorize_async(credential_id, fingerprint)
-                else:
-                    record = authorize(credential_id, fingerprint)
-                latest = await self._source_fingerprint_async(credential_id)
-                if latest == fingerprint:
+                with self._pool_lock:
+                    epoch = self._generation_epoch
+                fingerprint = await self._source_fingerprint_async(credential_id)
+                with self._pool_lock:
+                    if self._generation_epoch != epoch:
+                        continue
+                    record = self._authorize_locked(credential_id, fingerprint)
+                if await self._source_fingerprint_async(credential_id) == fingerprint:
                     return record
-                fingerprint = latest
         raise CredentialSourceError(
             f"The source for credential {credential_id!r} kept changing during authorization."
         )
+
+    def _authorize_locked(self, credential_id: str, fingerprint: str) -> CredentialRecord:
+        """Make ``fingerprint`` the active secret of ``credential_id``. Lock must be held."""
+        authorize = self._store_method("authorize_secret")
+        self._generation_epoch += 1
+        record: CredentialRecord = authorize(credential_id, fingerprint)
+        self._observed[credential_id] = fingerprint
+        return record
 
     def _store_method(self, name: str) -> Any:
         """Return the store's ``name`` method, or fail closed when the store does not offer it."""
@@ -443,19 +489,25 @@ class CredentialPool:
         credentials: Sequence[Credential],
         records: Mapping[str, CredentialRecord],
         excluded: set[str],
+        stale: set[tuple[str, str]],
     ) -> list[CredentialCandidate]:
         """Snapshot the credentials a strategy may choose from.
 
         Credentials at their concurrency cap, and those whose reservation was just lost to a
         concurrent acquirer or a concurrent state change (``excluded``), are left out: they are
-        temporarily ineligible and their health state is not touched. Every credential has a
-        record in ``records``.
+        temporarily ineligible and their health state is not touched. A superseded secret
+        (``stale``, as credential id and fingerprint) is left out only while the source still
+        presents that exact secret. Every credential has a record in ``records``.
         """
         candidates: list[CredentialCandidate] = []
         for cred in credentials:
             rec = records[cred.id]
             limit = self._concurrency_limit(cred)
-            if cred.id in excluded or (limit is not None and rec.in_flight_leases >= limit):
+            if (
+                cred.id in excluded
+                or (cred.id, cred.secret_fingerprint) in stale
+                or (limit is not None and rec.in_flight_leases >= limit)
+            ):
                 continue
             candidates.append(
                 CredentialCandidate(
@@ -498,23 +550,13 @@ class CredentialPool:
         with self._pool_lock:
             self._reclaim_sync()
             excluded: set[str] = set()
+            stale: set[tuple[str, str]] = set()
             while True:
                 credentials = self._source.get_credentials()
                 if not credentials:
                     raise NoCredentialsAvailableError("No credentials configured in pool.")
 
-                records = {r.credential_id: r for r in self._store.list_records()}
-                for cred in credentials:
-                    if cred.id not in records:
-                        records[cred.id] = self._initialize_record_sync(cred.id)
-                    fp = getattr(cred, "secret_fingerprint", None)
-                    if fp is not None and hasattr(self._store, "sync_credential"):
-                        records[cred.id] = self._store.sync_credential(
-                            cred.id, secret_fingerprint=fp
-                        )
-
-                candidates = self._build_candidates(credentials, records, excluded)
-                selected = self._strategy.select(candidates, context)
+                selected = self._select_locked(credentials, excluded, stale, context)
                 if selected is None:
                     raise NoCredentialsAvailableError("No eligible credentials available in pool.")
 
@@ -525,42 +567,34 @@ class CredentialPool:
                     lease.acquired_at,
                     max_concurrency=self._concurrency_limit(selected.credential),
                     expires_at=self._expires_at(lease.acquired_at),
-                    secret_fingerprint=getattr(selected.credential, "secret_fingerprint", None),
+                    secret_fingerprint=selected.credential.secret_fingerprint,
                 )
                 if reservation is LeaseReservation.RESERVED:
                     self._granted_leases[lease.lease_id] = lease
                     return lease
-                # AT_CAPACITY, INELIGIBLE or STALE: a lost race, not a credential fault.
-                excluded.add(selected.credential_id)
+                self._exclude_lost_race(selected, reservation, excluded, stale)
 
     async def acquire(self, context: SelectionContext | None = None) -> Lease:
-        """Acquire a credential lease asynchronously according to the configured strategy."""
+        """Acquire a credential lease asynchronously according to the configured strategy.
+
+        Only the source is awaited. The read is committed under the pool lock, and only when no
+        generation change overtook it; otherwise it is read again, so a rotation or
+        authorization made by a sync caller meanwhile is never leased from a superseded snapshot.
+        """
         async with self._get_async_lock():
             await self._reclaim_async()
             excluded: set[str] = set()
+            stale: set[tuple[str, str]] = set()
             while True:
+                with self._pool_lock:
+                    epoch = self._generation_epoch
                 credentials = await self._source.get_credentials_async()
-                if not credentials:
-                    raise NoCredentialsAvailableError("No credentials configured in pool.")
-
-                records = {r.credential_id: r for r in await self._store.list_records_async()}
-                for cred in credentials:
-                    if cred.id not in records:
-                        records[cred.id] = await self._initialize_record_async(cred.id)
-                    fp = getattr(cred, "secret_fingerprint", None)
-                    if fp is not None:
-                        if hasattr(self._store, "sync_credential_async"):
-                            records[cred.id] = await self._store.sync_credential_async(
-                                cred.id, secret_fingerprint=fp
-                            )
-                        elif hasattr(self._store, "sync_credential"):
-                            records[cred.id] = self._store.sync_credential(
-                                cred.id, secret_fingerprint=fp
-                            )
-
-                candidates = self._build_candidates(credentials, records, excluded)
-                with self._pool_lock:  # strategies are shared with concurrent sync acquirers
-                    selected = self._strategy.select(candidates, context)
+                with self._pool_lock:
+                    if self._generation_epoch != epoch:
+                        continue
+                    if not credentials:
+                        raise NoCredentialsAvailableError("No credentials configured in pool.")
+                    selected = self._select_locked(credentials, excluded, stale, context)
                 if selected is None:
                     raise NoCredentialsAvailableError("No eligible credentials available in pool.")
 
@@ -571,13 +605,50 @@ class CredentialPool:
                     lease.acquired_at,
                     max_concurrency=self._concurrency_limit(selected.credential),
                     expires_at=self._expires_at(lease.acquired_at),
-                    secret_fingerprint=getattr(selected.credential, "secret_fingerprint", None),
+                    secret_fingerprint=selected.credential.secret_fingerprint,
                 )
                 if reservation is LeaseReservation.RESERVED:
-                    self._granted_leases[lease.lease_id] = lease
+                    with self._pool_lock:
+                        self._granted_leases[lease.lease_id] = lease
                     return lease
-                # AT_CAPACITY, INELIGIBLE or STALE: a lost race, not a credential fault.
-                excluded.add(selected.credential_id)
+                self._exclude_lost_race(selected, reservation, excluded, stale)
+
+    def _select_locked(
+        self,
+        credentials: Sequence[Credential],
+        excluded: set[str],
+        stale: set[tuple[str, str]],
+        context: SelectionContext | None,
+    ) -> CredentialCandidate | None:
+        """Synchronise every presented secret, then select a candidate. Lock must be held.
+
+        Records are read and synchronised in the same critical section as the selection, so no
+        generation change can land between the two.
+        """
+        records = {r.credential_id: r for r in self._store.list_records()}
+        for cred in credentials:
+            if cred.id not in records:
+                records[cred.id] = self._initialize_record_sync(cred.id)
+            records[cred.id] = self._observe_locked(cred)
+        candidates = self._build_candidates(credentials, records, excluded, stale)
+        return self._strategy.select(candidates, context)
+
+    @staticmethod
+    def _exclude_lost_race(
+        selected: CredentialCandidate,
+        reservation: LeaseReservation,
+        excluded: set[str],
+        stale: set[tuple[str, str]],
+    ) -> None:
+        """Skip a candidate whose reservation was lost to a race, for the rest of this call.
+
+        A lost race is not a credential fault. A superseded snapshot excludes only its exact
+        secret, so once the source presents the current secret the credential is eligible again.
+        """
+        if reservation is LeaseReservation.STALE:
+            stale.add((selected.credential_id, selected.credential.secret_fingerprint))
+        else:  # AT_CAPACITY or INELIGIBLE
+            excluded.add(selected.credential_id)
 
     def _initialize_record_sync(self, credential_id: str) -> CredentialRecord:
         if hasattr(self._store, "initialize_record"):
@@ -585,15 +656,6 @@ class CredentialPool:
             return initialized
         self._store.update_state(credential_id, CredentialState.AVAILABLE)
         return self._store.get_record(credential_id) or CredentialRecord(
-            credential_id=credential_id, state=CredentialState.AVAILABLE
-        )
-
-    async def _initialize_record_async(self, credential_id: str) -> CredentialRecord:
-        if hasattr(self._store, "initialize_record"):
-            initialized: CredentialRecord = self._store.initialize_record(credential_id)
-            return initialized
-        await self._store.update_state_async(credential_id, CredentialState.AVAILABLE)
-        return await self._store.get_record_async(credential_id) or CredentialRecord(
             credential_id=credential_id, state=CredentialState.AVAILABLE
         )
 

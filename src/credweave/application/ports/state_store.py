@@ -130,11 +130,15 @@ class StateStore(Protocol):
     contract, and a store that does not honour it is refused by ``CredentialPool`` at
     construction. A store must provide:
 
-    - ``sync_credential(credential_id, secret_fingerprint=None, *, state, metadata)``, which
-      adopts a fingerprint the source presents. A never-adopted fingerprint becomes the next
-      generation; an already-adopted one is refused, leaving the store unchanged. Synchronisation
-      never changes lifecycle state. ``sync_credential_async`` is optional; the pool falls back
-      to the synchronous method.
+    - ``sync_credential(credential_id, secret_fingerprint=None, *, state, metadata,
+      last_observed)``, which adopts a fingerprint the source presents. ``last_observed`` is the
+      fingerprint the same caller presented last time, or ``None``. A never-adopted fingerprint
+      becomes the next generation only when the store already has a generation and
+      ``last_observed`` is that current generation; otherwise it is refused, because without
+      trustworthy source revisions the store cannot tell it is newer (explicit
+      ``authorize_secret`` is required). An already-adopted fingerprint is also refused,
+      leaving the store unchanged. Synchronisation never changes lifecycle state. The pool
+      always calls the synchronous method, so an asynchronous variant is not required.
     - ``reserve_lease(..., secret_fingerprint=...)``, which returns ``STALE`` unless the
       fingerprint is the current generation, and records the generation on the lease.
     - ``settle_lease``, which applies no outcome for a lease from an earlier generation.
@@ -151,7 +155,8 @@ class StateStore(Protocol):
 
     Fingerprints are keyed per process (see :mod:`credweave.domain._security`). A store shared
     by several processes must replace them with fingerprints keyed by a secret all of them share;
-    otherwise every process would see every synchronised secret as a new rotation.
+    otherwise no process could ever recognise a secret another process had adopted, so none could
+    advance the store from its own last observation.
     """
 
     def get_record(self, credential_id: str) -> CredentialRecord | None:

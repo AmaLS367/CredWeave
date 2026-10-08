@@ -139,11 +139,38 @@ class StoreWithoutAuthorize(MemoryStateStore):
     authorize_secret = None  # type: ignore[assignment]
 
 
+class LegacySyncStore(MemoryStateStore):
+    """A store that synchronises secrets but cannot receive the observer's last fingerprint.
+
+    Without ``last_observed`` it could not refuse an unseen secret from a stale observer, so the
+    pool refuses it at construction rather than let it adopt one.
+    """
+
+    def sync_credential(  # type: ignore[override]
+        self,
+        credential_id: str,
+        secret_fingerprint: str | None = None,
+        *,
+        state: Any = None,
+        metadata: Any = None,
+    ) -> Any:
+        return super().sync_credential(credential_id, secret_fingerprint)
+
+
 def test_store_without_sync_credential_is_refused_at_construction() -> None:
     with pytest.raises(ConfigurationError, match="sync_credential"):
         CredentialPool(
             source=ScriptedSource([_cred("A")]),
             store=StoreWithoutSync(clock=TestClock()),
+            clock=TestClock(),
+        )
+
+
+def test_store_whose_sync_credential_ignores_last_observed_is_refused_at_construction() -> None:
+    with pytest.raises(ConfigurationError, match="last_observed"):
+        CredentialPool(
+            source=ScriptedSource([_cred("A")]),
+            store=LegacySyncStore(clock=TestClock()),
             clock=TestClock(),
         )
 
@@ -199,11 +226,12 @@ def test_stale_pool_built_before_a_rotation_cannot_roll_back_to_its_baseline() -
     stale_source = ScriptedSource([_cred("A")], [_cred("A")], [_cred("A")])
     stale_pool = CredentialPool(source=stale_source, store=store, clock=clock)
 
-    fresh_pool = CredentialPool(source=ScriptedSource([_cred("B")]), store=store, clock=clock)
-    fresh_pool.report_sync(fresh_pool.acquire_sync(), Outcome.success())
+    rotating_source = ScriptedSource([_cred("A")], [_cred("B")])
+    rotating_pool = CredentialPool(source=rotating_source, store=store, clock=clock)
+    rotating_pool.report_sync(rotating_pool.acquire_sync(), Outcome.success())
     assert store.get_record("c1").state is CredentialState.AVAILABLE
 
-    # The stale source now reports A again, which the store adopted at construction.
+    # The stale source now reports A again, which the store adopted before B.
     with pytest.raises(NoCredentialsAvailableError):
         stale_pool.acquire_sync()
     assert store._secret_generations["c1"].current == _cred("B").secret_fingerprint

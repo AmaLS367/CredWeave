@@ -3,9 +3,9 @@
 Interleavings are made deterministic with :class:`_RacingStore`, which runs a hook immediately
 before the next reservation, exactly where another pool's rotation would land in production.
 
-Pools observe their starting secrets at construction, so a pool built with a new secret is itself
-a rotation. Competing-pool scenarios therefore start every source on the same secret and rotate
-explicitly, unless the test is about construction order.
+Pools observe their starting secrets at construction. A pool built over a store that already holds
+another secret cannot advance it (it is refused until authorized), so competing-pool scenarios start
+every source on the same secret and rotate explicitly, from a pool that is in sync.
 """
 
 import asyncio
@@ -172,8 +172,10 @@ def test_superseded_candidate_is_skipped_in_favour_of_current_credential() -> No
     store = MemoryStateStore(clock=clock)
     stale_source = _Source([_cred("c1", "A"), _cred("c2", "X")])
     pool = CredentialPool(source=stale_source, store=store, clock=clock)
-    # Constructing the other pool with B is itself a rotation the store observes.
-    other = CredentialPool(source=_Source([_cred("c1", "B")]), store=store, clock=clock)
+    rotating_source = _Source([_cred("c1", "A")])
+    other = CredentialPool(source=rotating_source, store=store, clock=clock)
+    # The other pool is in sync with A, so its rotation to B is adopted.
+    rotating_source.set([_cred("c1", "B")])
     other.report_sync(other.acquire_sync(), Outcome.success())
 
     leased_ids = set()
@@ -208,23 +210,30 @@ def test_a_b_a_reversion_does_not_apply_outcome_of_the_earlier_a_lease() -> None
     assert_lease_accounting(store)
 
 
-def test_competing_pools_with_unordered_secrets_fail_closed_for_the_earlier_one() -> None:
-    """Two distinct secrets that never ordered each other: the later observation wins.
+def test_competing_pool_built_on_unordered_secret_is_refused_until_authorized() -> None:
+    """Two distinct secrets that never ordered each other: a later pool cannot adopt its own.
 
-    The store cannot know which of two unseen secrets is newer. It adopts the one it observes
-    second and refuses the other, so no pool can flip the credential back and forth.
+    Without source revisions the store cannot know which of two unseen secrets is newer, so a
+    pool built over a store holding another secret is refused rather than allowed to flip the
+    credential back and forth. Only an explicit authorization makes its secret active.
     """
     clock = TestClock()
     store = MemoryStateStore(clock=clock)
     pool_a = CredentialPool(source=_Source([_cred("c1", "A")]), store=store, clock=clock)
     pool_b = CredentialPool(source=_Source([_cred("c1", "B")]), store=store, clock=clock)
 
-    for _ in range(3):
-        with pytest.raises(NoCredentialsAvailableError):
-            pool_a.acquire_sync()
+    lease_a = pool_a.acquire_sync()
+    assert lease_a.credential.require_secret("key") == "A"
+    pool_a.report_sync(lease_a, Outcome.success())
+    with pytest.raises(NoCredentialsAvailableError):
+        pool_b.acquire_sync()
+
+    pool_b.authorize_secret("c1")
     lease_b = pool_b.acquire_sync()
     assert lease_b.credential.require_secret("key") == "B"
     pool_b.report_sync(lease_b, Outcome.success())
+    with pytest.raises(NoCredentialsAvailableError):
+        pool_a.acquire_sync()
     assert_lease_accounting(store)
 
 

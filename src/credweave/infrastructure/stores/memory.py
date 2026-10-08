@@ -63,8 +63,10 @@ class MemoryStateStore(StateStore):
     a min-heap, so reclamation costs O(log n) per reclaimed lease and O(1) when nothing is due.
 
     Secret rotation is versioned by generation (see :class:`StateStore`). A fingerprint the
-    store has never seen is adopted as the next generation, but a rotation never changes a
-    credential's lifecycle state: a REVOKED or UNHEALTHY credential is recovered only by
+    store has never seen is adopted as the next generation only when the synchronising caller
+    advances from the current generation (its ``last_observed``); otherwise it is refused until
+    :meth:`authorize_secret`. A rotation never changes a credential's lifecycle state: a REVOKED
+    or UNHEALTHY credential is recovered only by
     :meth:`authorize_secret` (or :meth:`reset`). A fingerprint it has already adopted is never
     re-adopted by synchronisation, so a source still holding an older secret cannot roll the
     credential back or reactivate it.
@@ -124,6 +126,7 @@ class MemoryStateStore(StateStore):
         *,
         state: CredentialState = CredentialState.AVAILABLE,
         metadata: Mapping[str, Any] | None = None,
+        last_observed: str | None = None,
     ) -> CredentialRecord:
         """Register or synchronize a credential with the secret fingerprint a source presented.
 
@@ -131,9 +134,12 @@ class MemoryStateStore(StateStore):
         a REVOKED or UNHEALTHY credential.
 
         - The first fingerprint seen for a credential becomes generation 1.
-        - A fingerprint never adopted before is a rotation and becomes the next generation.
-          Leases granted under the previous generation are then pre-rotation leases and their
-          outcomes are ignored.
+        - A fingerprint never adopted before is a rotation and becomes the next generation, but
+          only when ``last_observed`` (the caller's previous observation) is the current
+          generation: the caller then advances the store from the secret it last saw. Any other
+          unseen fingerprint is refused, because nothing proves that it is newer. Leases granted
+          under the previous generation are then pre-rotation leases and their outcomes are
+          ignored.
         - A fingerprint already adopted is stale (a superseded snapshot, or a secret the
           credential was rotated away from) and is refused: nothing changes.
         - An unseen fingerprint is also refused once the adopted history has been truncated,
@@ -149,10 +155,15 @@ class MemoryStateStore(StateStore):
                 )
                 self._records[credential_id] = existing
             if secret_fingerprint is not None:
-                self._observe_secret(credential_id, secret_fingerprint)
+                self._observe_secret(credential_id, secret_fingerprint, last_observed)
             return self._check_cooldown_recovery(existing, self._clock.now())
 
-    def _observe_secret(self, credential_id: str, secret_fingerprint: str) -> None:
+    def _observe_secret(
+        self,
+        credential_id: str,
+        secret_fingerprint: str,
+        last_observed: str | None,
+    ) -> None:
         """Adopt a fingerprint a source presented, unless it is stale. Lock must be held."""
         generations = self._secret_generations.get(credential_id)
         if generations is None:
@@ -163,6 +174,10 @@ class MemoryStateStore(StateStore):
             return
         if generations.truncated:
             # The history cannot rule out a replay of a forgotten secret: fail closed.
+            return
+        if last_observed is None or last_observed != generations.current:
+            # Unseen, and the caller is not advancing from the current secret: its lineage
+            # cannot prove the new secret is newer than the one the store holds. Fail closed.
             return
         self._adopt_secret(credential_id, secret_fingerprint)
 
@@ -197,6 +212,7 @@ class MemoryStateStore(StateStore):
         *,
         state: CredentialState = CredentialState.AVAILABLE,
         metadata: Mapping[str, Any] | None = None,
+        last_observed: str | None = None,
     ) -> CredentialRecord:
         """Synchronize credential state and secret fingerprint asynchronously."""
         return self.sync_credential(
@@ -204,6 +220,7 @@ class MemoryStateStore(StateStore):
             secret_fingerprint,
             state=state,
             metadata=metadata,
+            last_observed=last_observed,
         )
 
     def authorize_secret(self, credential_id: str, secret_fingerprint: str) -> CredentialRecord:

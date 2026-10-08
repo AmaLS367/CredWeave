@@ -47,7 +47,7 @@ def test_rotation_advances_generation_without_recovering_revoked_credential() ->
     store.settle_lease("l1", "c1", Outcome.auth_failed(reason="revoked"), clock.now())
     assert store.get_record("c1").state is CredentialState.REVOKED
 
-    record = store.sync_credential("c1", _fp("B"))
+    record = store.sync_credential("c1", _fp("B"), last_observed=_fp("A"))
     assert record.state is CredentialState.REVOKED
     assert _reserve(store, "l2", clock.now(), _fp("B")) is LeaseReservation.INELIGIBLE
 
@@ -69,7 +69,7 @@ def test_unseen_fingerprint_never_changes_lifecycle_state(state: CredentialState
     store.update_state("c1", state, cooldown_until=cooldown_until)
     before = store.get_record("c1")
 
-    after = store.sync_credential("c1", _fp("B"))
+    after = store.sync_credential("c1", _fp("B"), last_observed=_fp("A"))
     assert after.state is before.state
     assert after.consecutive_failures == before.consecutive_failures
     assert after.cooldown_until == before.cooldown_until
@@ -96,7 +96,7 @@ def test_authorize_rolls_back_to_earlier_secret_under_a_new_generation() -> None
     store = MemoryStateStore(clock=clock)
     store.sync_credential("c1", _fp("A"))
     _reserve(store, "old_a", clock.now(), _fp("A"))
-    store.sync_credential("c1", _fp("B"))
+    store.sync_credential("c1", _fp("B"), last_observed=_fp("A"))
     _reserve(store, "b", clock.now(), _fp("B"))
     store.settle_lease("b", "c1", Outcome.auth_failed(reason="B revoked"), clock.now())
     assert store.get_record("c1").state is CredentialState.REVOKED
@@ -137,14 +137,16 @@ def test_history_is_bounded_and_truncation_fails_closed(monkeypatch: pytest.Monk
     clock = TestClock()
     store = MemoryStateStore(clock=clock)
     store.sync_credential("c1", _fp("A"))
-    store.sync_credential("c1", _fp("B"))
-    store.sync_credential("c1", _fp("C"))  # evicts A; history is now truncated
+    store.sync_credential("c1", _fp("B"), last_observed=_fp("A"))
+    # Evicts A, so the history is now truncated.
+    store.sync_credential("c1", _fp("C"), last_observed=_fp("B"))
 
-    replay = store.sync_credential("c1", _fp("A"))
+    replay = store.sync_credential("c1", _fp("A"), last_observed=_fp("C"))
     assert replay.state is CredentialState.AVAILABLE
     assert _reserve(store, "replay", clock.now(), _fp("A")) is LeaseReservation.STALE
 
-    store.sync_credential("c1", _fp("D"))  # unseen, but truncated: refused, not adopted
+    # Unseen, but truncated: refused, not adopted.
+    store.sync_credential("c1", _fp("D"), last_observed=_fp("A"))
     assert _reserve(store, "d", clock.now(), _fp("D")) is LeaseReservation.STALE
     assert _reserve(store, "c", clock.now(), _fp("C")) is LeaseReservation.RESERVED
     assert _lease(store, "c").secret_generation == 3
@@ -159,7 +161,8 @@ def test_adopted_history_stays_within_the_limit_under_many_rotations() -> None:
     limit = MemoryStateStore._SECRET_HISTORY_LIMIT
     store = MemoryStateStore(clock=TestClock())
     for n in range(3 * limit):
-        store.sync_credential("c1", _fp(f"secret-{n}"))
+        lineage = _fp(f"secret-{n - 1}") if n else None
+        store.sync_credential("c1", _fp(f"secret-{n}"), last_observed=lineage)
 
     generations = store._secret_generations["c1"]
     assert len(generations.adopted) == limit
@@ -175,11 +178,11 @@ def test_superseded_fingerprint_is_refused_and_changes_nothing() -> None:
     clock = TestClock()
     store = MemoryStateStore(clock=clock)
     store.sync_credential("c1", _fp("A"))
-    store.sync_credential("c1", _fp("B"))
+    store.sync_credential("c1", _fp("B"), last_observed=_fp("A"))
     before_records = store.list_records()
     before_leases = store.list_active_leases()
 
-    store.sync_credential("c1", _fp("A"))
+    store.sync_credential("c1", _fp("A"), last_observed=_fp("B"))
     assert _reserve(store, "stale", clock.now(), _fp("A")) is LeaseReservation.STALE
 
     assert store.list_records() == before_records
@@ -191,11 +194,11 @@ def test_stale_source_cannot_reactivate_revoked_credential() -> None:
     clock = TestClock()
     store = MemoryStateStore(clock=clock)
     store.sync_credential("c1", _fp("A"))
-    store.sync_credential("c1", _fp("B"))
+    store.sync_credential("c1", _fp("B"), last_observed=_fp("A"))
     _reserve(store, "l1", clock.now(), _fp("B"))
     store.settle_lease("l1", "c1", Outcome.auth_failed(reason="revoked"), clock.now())
 
-    record = store.sync_credential("c1", _fp("A"))
+    record = store.sync_credential("c1", _fp("A"), last_observed=_fp("B"))
     assert record.state is CredentialState.REVOKED
     assert _reserve(store, "stale", clock.now(), _fp("A")) is LeaseReservation.STALE
     assert _reserve(store, "current", clock.now(), _fp("B")) is LeaseReservation.INELIGIBLE
@@ -209,9 +212,9 @@ def test_superseded_snapshot_does_not_clear_cooldown_of_current_credential() -> 
     store.sync_credential("c1", _fp("A"))
     cooldown_until = clock.now() + timedelta(seconds=60)
     store.update_state("c1", CredentialState.COOLDOWN, cooldown_until=cooldown_until)
-    store.sync_credential("c1", _fp("B"))
+    store.sync_credential("c1", _fp("B"), last_observed=_fp("A"))
 
-    store.sync_credential("c1", _fp("A"))
+    store.sync_credential("c1", _fp("A"), last_observed=_fp("B"))
     record = store.get_record("c1")
     assert record.state is CredentialState.COOLDOWN
     assert record.cooldown_until == cooldown_until
@@ -225,8 +228,8 @@ def test_reverted_secret_is_not_readopted_and_old_lease_outcome_is_discarded() -
     store = MemoryStateStore(clock=clock)
     store.sync_credential("c1", _fp("A"))
     assert _reserve(store, "old", clock.now(), _fp("A")) is LeaseReservation.RESERVED
-    store.sync_credential("c1", _fp("B"))
-    store.sync_credential("c1", _fp("A"))
+    store.sync_credential("c1", _fp("B"), last_observed=_fp("A"))
+    store.sync_credential("c1", _fp("A"), last_observed=_fp("B"))
 
     settlement = store.settle_lease("old", "c1", Outcome.auth_failed(reason="old A"), clock.now())
     assert settlement is LeaseSettlement.SETTLED
@@ -242,7 +245,7 @@ def test_pre_rotation_lease_releases_slot_without_applying_outcome() -> None:
     store = MemoryStateStore(clock=clock)
     store.sync_credential("c1", _fp("A"))
     _reserve(store, "old", clock.now(), _fp("A"))
-    store.sync_credential("c1", _fp("B"))
+    store.sync_credential("c1", _fp("B"), last_observed=_fp("A"))
     _reserve(store, "new", clock.now(), _fp("B"))
 
     settlement = store.settle_lease("old", "c1", Outcome.permanent_failure(reason="x"), clock.now())
@@ -264,7 +267,7 @@ def test_rotation_keeps_pre_rotation_leases_counted_against_concurrency_cap() ->
         )
         is LeaseReservation.RESERVED
     )
-    store.sync_credential("c1", _fp("B"))
+    store.sync_credential("c1", _fp("B"), last_observed=_fp("A"))
 
     result = store.reserve_lease(
         "c1", "new", clock.now(), max_concurrency=1, secret_fingerprint=_fp("B")
@@ -278,9 +281,9 @@ def test_every_fingerprint_is_adopted_at_most_once() -> None:
     store = MemoryStateStore(clock=TestClock())
     store.sync_credential("c1", _fp("A"))
     for _ in range(3):
-        store.sync_credential("c1", _fp("B"))
-        store.sync_credential("c1", _fp("A"))
-    store.sync_credential("c1", _fp("C"))
+        store.sync_credential("c1", _fp("B"), last_observed=_fp("A"))
+        store.sync_credential("c1", _fp("A"), last_observed=_fp("B"))
+    store.sync_credential("c1", _fp("C"), last_observed=_fp("B"))  # B is current after the loop
 
     clock = TestClock()
     assert _reserve(store, "c", clock.now(), _fp("C")) is LeaseReservation.RESERVED
@@ -294,7 +297,7 @@ def test_reservation_without_prior_observation_adopts_its_secret() -> None:
     assert _reserve(store, "first", clock.now(), _fp("A")) is LeaseReservation.RESERVED
     assert _lease(store, "first").secret_generation == 1
 
-    store.sync_credential("c1", _fp("B"))
+    store.sync_credential("c1", _fp("B"), last_observed=_fp("A"))
     assert _reserve(store, "second", clock.now(), _fp("A")) is LeaseReservation.STALE
 
 
@@ -320,7 +323,7 @@ def test_expired_superseded_lease_is_reclaimed_without_outcome() -> None:
     store.reserve_lease(
         "c1", "old", clock.now(), expires_at=clock.now(), secret_fingerprint=_fp("A")
     )
-    store.sync_credential("c1", _fp("B"))
+    store.sync_credential("c1", _fp("B"), last_observed=_fp("A"))
     clock.advance(3600)
 
     reclaimed = store.reclaim_expired_leases(clock.now())
@@ -335,7 +338,7 @@ async def test_async_sync_and_reserve_refuse_superseded_secret() -> None:
     clock = TestClock()
     store = MemoryStateStore(clock=clock)
     await store.sync_credential_async("c1", _fp("A"))
-    await store.sync_credential_async("c1", _fp("B"))
+    await store.sync_credential_async("c1", _fp("B"), last_observed=_fp("A"))
 
     stale = await store.reserve_lease_async("c1", "stale", clock.now(), secret_fingerprint=_fp("A"))
     assert stale is LeaseReservation.STALE
@@ -358,3 +361,41 @@ def test_fingerprint_is_keyed_so_an_exposed_value_cannot_be_checked_offline() ->
     assert len(fingerprint) == 64
     assert fingerprint == compute_secrets_fingerprint({"key": secret})
     assert fingerprint != compute_secrets_fingerprint({"key": "sk-other"})
+
+
+def test_unseen_fingerprint_without_observer_lineage_is_refused() -> None:
+    """A caller with no prior observation cannot advance an existing generation on its own."""
+    clock = TestClock()
+    store = MemoryStateStore(clock=clock)
+    store.sync_credential("c1", _fp("A"))
+    store.sync_credential("c1", _fp("B"))  # unseen, and the caller has no lineage: refused
+
+    assert _reserve(store, "old", clock.now(), _fp("A")) is LeaseReservation.RESERVED
+    assert _reserve(store, "new", clock.now(), _fp("B")) is LeaseReservation.STALE
+    assert _lease(store, "old").secret_generation == 1
+    assert_lease_accounting(store)
+
+
+def test_unseen_fingerprint_from_an_in_sync_observer_is_adopted() -> None:
+    """Hot reload: an observer that last saw the current secret may advance it."""
+    clock = TestClock()
+    store = MemoryStateStore(clock=clock)
+    store.sync_credential("c1", _fp("A"))
+    store.sync_credential("c1", _fp("B"), last_observed=_fp("A"))
+
+    assert _reserve(store, "new", clock.now(), _fp("B")) is LeaseReservation.RESERVED
+    assert _lease(store, "new").secret_generation == 2
+
+
+def test_unseen_fingerprint_from_an_out_of_sync_observer_is_refused() -> None:
+    """An observer whose last view is no longer current cannot roll the store forward either."""
+    clock = TestClock()
+    store = MemoryStateStore(clock=clock)
+    store.sync_credential("c1", _fp("A"))
+    store.sync_credential("c1", _fp("B"), last_observed=_fp("A"))
+    store.sync_credential("c1", _fp("C"), last_observed=_fp("A"))  # stale lineage: refused
+
+    assert _reserve(store, "c", clock.now(), _fp("C")) is LeaseReservation.STALE
+    assert _reserve(store, "b", clock.now(), _fp("B")) is LeaseReservation.RESERVED
+    assert _lease(store, "b").secret_generation == 2
+    assert_lease_accounting(store)
