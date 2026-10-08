@@ -14,6 +14,7 @@ CredWeave is a provider-agnostic, protocol-independent credential lifecycle engi
 - [Architectural Invariants](#-architectural-invariants)
 - [Security Guidelines](#-security-guidelines)
 - [Pull Request Process](#-pull-request-process)
+- [Releases](#-releases)
 
 ---
 
@@ -137,3 +138,7 @@ Secrets handling demands uncompromising security guarantees:
    Follow conventional commit style (e.g. `feat: add RoundRobinStrategy`, `fix: mask secret in lease error message`).
 5. **Open a Pull Request:**
    Provide a clear summary of your changes, reference any related issues, and ensure CI passes.
+
+## 📦 Releases
+
+Maintainers publish releases to PyPI through the `Release` workflow, which runs only when a GitHub Release is published. See [RELEASING.md](RELEASING.md) for the Trusted Publisher setup and the release procedure.

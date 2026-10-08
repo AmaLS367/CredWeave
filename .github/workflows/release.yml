@@ -1,0 +1,203 @@
+name: Release
+
+# Publishes to PyPI only when a GitHub Release is published. Ordinary pushes, pull requests and
+# manual runs never reach the publish job. Publishing uses PyPI Trusted Publishing (OIDC), so no
+# PyPI API token is stored anywhere.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pypi-release
+  cancel-in-progress: false
+
+jobs:
+  validate-tag:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Check that the tag matches pyproject.toml
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import sys
+          import tomllib
+
+          tag = os.environ["TAG"]
+          match = re.fullmatch(r"v(\d+\.\d+\.\d+)", tag)
+          if match is None:
+              sys.exit(f"Release tag {tag!r} must look like vX.Y.Z.")
+          with open("pyproject.toml", "rb") as handle:
+              version = tomllib.load(handle)["project"]["version"]
+          if version != match.group(1):
+              sys.exit(
+                  f"Release tag {tag!r} does not match pyproject.toml version {version!r}."
+              )
+          print(f"Tag {tag} matches pyproject.toml version {version}.")
+          PY
+
+  checks:
+    name: Release checks (Python ${{ matrix.python-version }})
+    needs: validate-tag
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+
+      - name: Run Ruff and strict mypy
+        if: matrix.python-version == '3.10'
+        run: |
+          ruff check .
+          ruff format --check .
+          mypy
+
+      - name: Run pytest
+        if: matrix.python-version != '3.13'
+        run: pytest
+
+      - name: Run pytest with branch coverage
+        if: matrix.python-version == '3.13'
+        run: pytest --cov=credweave --cov-branch --cov-report=term-missing --cov-fail-under=90
+
+  build:
+    name: Build and verify distributions
+    needs: [validate-tag, checks]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install build tools
+        run: python -m pip install --upgrade pip build twine
+
+      - name: Build sdist and wheel
+        run: python -m build --sdist --wheel --outdir dist/
+
+      - name: Check distribution names and metadata
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python - <<'PY'
+          import glob
+          import os
+          import sys
+          import tomllib
+
+          tag = os.environ["TAG"]
+          with open("pyproject.toml", "rb") as handle:
+              version = tomllib.load(handle)["project"]["version"]
+          expected = {
+              f"credweave-{version}-py3-none-any.whl",
+              f"credweave-{version}.tar.gz",
+          }
+          found = {os.path.basename(path) for path in glob.glob("dist/*")}
+          if found != expected:
+              sys.exit(f"Expected exactly {sorted(expected)} in dist/, found {sorted(found)}.")
+          print(f"dist/ contains {sorted(found)} for {tag}.")
+          PY
+
+      - name: Check metadata with twine
+        run: twine check --strict dist/*
+
+      - name: Install the wheel into a clean environment and import it
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python -m venv "${RUNNER_TEMP}/wheel-env"
+          "${RUNNER_TEMP}/wheel-env/bin/python" -m pip install --quiet dist/*.whl
+          cd "${RUNNER_TEMP}"
+          "${RUNNER_TEMP}/wheel-env/bin/python" -I - <<'PY'
+          import os
+          import pathlib
+
+          import credweave
+          from credweave import Credential, CredentialPool, Outcome
+
+          expected = os.environ["TAG"].removeprefix("v")
+          assert credweave.__version__ == expected, (credweave.__version__, expected)
+          workspace = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          imported = pathlib.Path(credweave.__file__).resolve()
+          assert workspace not in imported.parents, imported
+
+          pool = CredentialPool(credentials=[Credential("smoke", secrets={"k": "value-123"})])
+          lease = pool.acquire_sync()
+          pool.report_sync(lease, Outcome.success())
+          print(f"Installed wheel imports credweave {credweave.__version__} from {imported}.")
+          PY
+
+      - name: Install the sdist into a clean environment and import it
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python -m venv "${RUNNER_TEMP}/sdist-env"
+          "${RUNNER_TEMP}/sdist-env/bin/python" -m pip install --quiet dist/*.tar.gz
+          cd "${RUNNER_TEMP}"
+          "${RUNNER_TEMP}/sdist-env/bin/python" -I -c "import credweave, os; assert credweave.__version__ == os.environ['TAG'].removeprefix('v'); print('Installed sdist imports credweave', credweave.__version__)"
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-distributions
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/credweave/
+    permissions:
+      id-token: write
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v8
+        with:
+          name: python-distributions
+          path: dist/
+
+      - name: Publish with Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
