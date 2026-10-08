@@ -235,7 +235,10 @@ class CredentialPool:
         self._granted_leases: weakref.WeakValueDictionary[str, Lease] = (
             weakref.WeakValueDictionary()
         )
-        self._async_lock: asyncio.Lock | None = None
+        self._async_locks: dict[asyncio.AbstractEventLoop, asyncio.Lock] = {}
+        """One lock per event loop that runs asynchronous calls on this pool, guarded by
+        ``_pool_lock``. An ``asyncio.Lock`` binds to the loop it first waits on, so a single lock
+        would break the pool for every later loop."""
         self._observed: dict[str, str] = {}
         """The secret fingerprint this pool last presented to the store, per credential id."""
         self._generation_epoch = 0
@@ -406,9 +409,20 @@ class CredentialPool:
         return ttl
 
     def _get_async_lock(self) -> asyncio.Lock:
-        if self._async_lock is None:
-            self._async_lock = asyncio.Lock()
-        return self._async_lock
+        """Return the lock that serialises asynchronous calls on the running event loop.
+
+        Locks of loops that have since closed are dropped. Correctness across loops does not
+        depend on this lock: reservations are atomic in the store and selections run under
+        ``_pool_lock``.
+        """
+        loop = asyncio.get_running_loop()
+        with self._pool_lock:
+            for closed in [known for known in self._async_locks if known.is_closed()]:
+                del self._async_locks[closed]
+            lock = self._async_locks.get(loop)
+            if lock is None:
+                lock = self._async_locks[loop] = asyncio.Lock()
+            return lock
 
     @property
     def initial_credentials(self) -> tuple[Credential, ...]:
